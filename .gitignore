@@ -43,6 +43,8 @@ vendor/
 # Local tool state
 .cache/
 .claude/
+.gocache/
+.gomodcache/
 
 # Project specific - generated config files
 # (don't ignore examples/)

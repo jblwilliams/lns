@@ -1,349 +1,273 @@
 # lns
 
-**Local Name System** – development reverse proxy manager using Caddy. Avoid port conflicts across projects.
+`lns` is a repo-first local reverse proxy manager for Caddy.
 
-## The Problem
+Each repo keeps its canonical service definition in `lns.json`. `lns sync` validates that file and compiles it into the global registry and generated Caddy config. No silent `generic` fallback. No opportunistic port reassignment.
 
-You're working on multiple projects:
-- Project A: Next.js on port 3000
-- Project B: Nuxt on port 3000
-- Project C: FastAPI on port 8000, Vite on port 5173
+## Why
 
-Only one can bind to each port at a time. You end up with:
-- Constantly changing ports
-- Forgetting which project uses which port
-- Broken bookmarks and muscle memory
-- Docker services clashing with local dev servers
+Local development usually breaks down around ports:
 
-## The Solution
+- multiple repos want `3000`
+- web and backend services drift from what the repo actually expects
+- Caddy or proxy config gets out of sync with the codebase
+- the real source of truth ends up buried in a global registry instead of the repo
 
-**lns** manages a single Caddy reverse proxy that routes by hostname:
-
-```
-http://project-a.localhost:8888  →  localhost:3000
-http://project-b.localhost:8888  →  localhost:3001  (auto-assigned)
-http://project-c-api.localhost:8888  →  localhost:8000
-http://project-c-frontend.localhost:8888  →  localhost:5173
-```
-
-One proxy entry point (default `:8888`; optional `:80`). No `/etc/hosts` editing (`.localhost` auto-resolves). Global registry prevents conflicts.
+`lns` fixes that by making the repo own its service config and making sync explicit.
 
 ## Installation
-
-### Go Install
 
 ```bash
 go install ./cmd/lns
 ```
 
-### Build from Source
+You also need Caddy installed:
 
 ```bash
-git clone <your-repo-url>
-cd lns
-make build
-sudo make install
+# macOS
+brew install caddy
+
+# Ubuntu / Debian
+sudo apt install caddy
 ```
-
-### Prerequisites
-
-1. **Caddy** must be installed:
-   ```bash
-   # macOS
-   brew install caddy
-
-   # Ubuntu/Debian
-   sudo apt install caddy
-
-   # Other: https://caddyserver.com/docs/install
-   ```
-
-2. **Optional: use port 80**:
-   ```bash
-   # Default proxy port is 8888 (no elevated privileges needed).
-   # Note: binding to :80 is a "privileged port" on most systems. If Caddy is running on the host,
-   # you'll typically need sudo/admin privileges (common on macOS), or to run Caddy via a privileged
-   # service manager. On Linux you can usually avoid running as root with setcap:
-   # If you choose port 80 on Linux, allow Caddy to bind without root:
-   sudo setcap 'cap_net_bind_service=+ep' $(which caddy)
-   ```
 
 ## Quick Start
 
 ```bash
-# 1. Initialize your project
+# 1. Bootstrap lns.json from the current repo
 cd ~/projects/my-app
-lns init my-app
+lns init
 
-# 2. Add services
-lns add my-app frontend --framework nextjs
-lns add my-app api --framework fastapi --port 8000
+# 2. Review lns.json
+#    If anything is unresolved, fill it in manually or add services explicitly
+lns service add api --root api --port 8000 --profile standard
 
-# 3. Start the global proxy
-lns start  # runs interactive setup on first run
+# 3. Compile repo config into registry + Caddy state
+lns sync
 
-# 4. Start your dev servers and access via (default):
-#    http://my-app-frontend.localhost:8888
-#    http://my-app-api.localhost:8888
-# (If you configure port 80, you can omit :8888.)
-```
-
-## Commands
-
-### Project Management
-
-```bash
-# Initialize a new project
-lns init <project-name> [--path /path/to/project] [--docker]
-
-# Add a service to a project
-lns add <project> <service> --framework <type> [--port <port>]
-
-# Remove a service or project
-lns remove <project> [service]
-
-# List all projects and services
-lns status
-```
-
-### Port Management
-
-```bash
-# Check if a port is available
-lns check 3000
-
-# Get suggested port for a framework
-lns suggest nextjs
-
-# View all port assignments
-lns ports
-```
-
-### Caddy Control
-
-```bash
-# Interactive setup (port + hostnames + admin address)
-lns setup
-
-# Start the global Caddy proxy
+# 4. Start the proxy
 lns start
 
-# Reload after changes
+# 5. Reload Caddy after later syncs
 lns reload
-
-# Stop Caddy
-lns stop
-
-# Check system requirements
-lns doctor
 ```
 
-### Export & Configuration
+After sync, services are available at:
 
-```bash
-# Export standalone Caddyfile for a project (default upstream: host)
-lns export my-app -o Caddyfile
-
-# Export standalone Caddyfile using docker upstreams (container DNS)
-lns export my-app -o Caddyfile --upstream docker
-
-# Export docker-compose snippet for a project
-lns export my-app --docker-compose
-
-# Show configuration paths
-lns config
+```text
+single-service repo:  http://<prefix>.localhost:8888
+multi-service repo:   http://<prefix>-<service>.localhost:8888
 ```
 
-## Supported Frameworks
+If you configure the proxy HTTP port to `80`, the `:8888` suffix disappears.
 
-| Framework | Default Port | Port Range |
-|-----------|-------------|------------|
-| Next.js (`nextjs`) | 3000 | 3000-3099 |
-| Nuxt (`nuxt`) | 3000 | 3100-3199 |
-| Vite (`vite`) | 5173 | 5173-5272 |
-| Vue CLI (`vue-cli`) | 8080 | 8080-8099 |
-| Create React App (`react-cra`) | 3000 | 3200-3299 |
-| FastAPI (`fastapi`) | 8000 | 8000-8079 |
-| Django (`django`) | 8000 | 8100-8179 |
-| Express (`express`) | 3000 | 4000-4099 |
-| Rails (`rails`) | 3000 | 4100-4199 |
-| Flask (`flask`) | 5000 | 5000-5099 |
-| Generic (`generic`) | 8080 | 9000-9099 |
+## Canonical Config
 
-When you add a service without specifying a port, lns auto-assigns the next available port in the framework's range.
+`lns.json` is the source of truth for a repo.
 
-## Docker Support
-
-### With Global Proxy
-
-For Docker services that should be accessible via the global proxy, publish the container port to your host and register that host port with lns (the global proxy always targets `localhost:<port>`):
-
-```bash
-# Register a Docker service (make sure its port is published to localhost)
-lns add my-app db --framework generic --port 5432 --docker --container postgres_container
-```
-
-### Caddy in Docker (Optional)
-
-If you want Caddy to run in the same docker-compose network (so it can proxy to container DNS names), export a Caddyfile with docker upstreams and add a Caddy service:
-
-```bash
-# 1) Export a Caddyfile that proxies to containers by name
-lns export my-app -o Caddyfile --upstream docker
-
-# 2) Print a docker-compose snippet for Caddy
-lns export my-app --docker-compose
-```
-
-Add the snippet to your docker-compose.yml and ensure it mounts `./Caddyfile`:
-
-```yaml
-services:
-  caddy:
-    image: caddy:2-alpine
-    ports:
-      - "8888:8888"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    networks:
-      - app_network
-```
-
-## How It Works
-
-### Global Registry
-
-All port assignments are stored in `~/.lns/registry.json`:
+Example:
 
 ```json
 {
-  "version": "1.0",
-  "projects": {
-    "my-app": {
-      "name": "my-app",
-      "services": [
-        {"name": "frontend", "port": 3000, "framework": "nextjs"},
-        {"name": "api", "port": 8000, "framework": "fastapi"}
-      ]
+  "name": "my-app",
+  "prefix": "my-app",
+  "services": {
+    "web": {
+      "root": ".",
+      "port": 5179,
+      "profile": "hmr",
+      "source": "detected",
+      "status": "resolved"
+    },
+    "api": {
+      "root": "api",
+      "port": 8000,
+      "profile": "standard",
+      "source": "manual",
+      "status": "resolved"
     }
-  },
-  "port_assignments": {
-    "3000": "my-app:frontend",
-    "8000": "my-app:api"
   }
 }
 ```
 
-### Caddyfile Generation
+Required top-level fields:
 
-Each project gets its own config in `~/.lns/projects/`:
+- `name`
+- `services`
 
-```caddyfile
-# ~/.lns/projects/my-app.caddy
-http://my-app-frontend.localhost:8888 {
-    reverse_proxy localhost:3000 {
-        header_up Host {host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-    }
-}
+Required resolved service fields:
 
-http://my-app-api.localhost:8888 {
-    reverse_proxy localhost:8000
-}
+- `root`
+- `port`
+- `profile`
+
+Optional service fields:
+
+- `hostname`
+- `source`
+- `status`
+- `docker`
+- `container_name`
+
+Service profiles:
+
+- `hmr`: use proxy headers needed by HMR-style web dev servers
+- `standard`: use a normal reverse proxy block
+
+`lns init` may write unresolved stubs when detection is ambiguous. `lns sync` refuses to compile unresolved services.
+
+## Command Model
+
+Primary workflow:
+
+```bash
+lns init
+lns sync
+lns status
+lns reload
+lns start
+lns stop
+lns doctor
+lns service add <name> --port <port>
 ```
 
-The global Caddyfile imports all project configs:
+Useful supporting commands:
 
-```caddyfile
-# ~/.lns/Caddyfile
-{
-    auto_https off
-    admin 127.0.0.1:20190
-    http_port 8888
-}
+```bash
+# Show the repo-local view if lns.json exists in the current directory
+lns status
 
-import ~/.lns/projects/*.caddy
+# Force the global registry view
+lns status --global
+
+# Check whether a canonical port is already owned
+lns check 5179
+
+# Export compiled Caddy config for a synced project
+lns export my-app -o Caddyfile
+
+# Show config paths
+lns config
+
+# Interactive proxy setup (proxy port + admin address)
+lns setup
 ```
 
-## Why .localhost?
+## Detection and Validation
 
-The `.localhost` TLD is [reserved by RFC 6761](https://www.rfc-editor.org/rfc/rfc6761) and automatically resolves to `127.0.0.1`. This means:
+`lns init` and `lns status` inspect common repo signals:
 
-- No `/etc/hosts` editing required
-- Works out of the box on all modern systems
-- Each subdomain is a separate "site" (useful for cookies, localStorage)
-- No conflicts with real domains
+- `package.json`
+- `vite.config.*`
+- `next.config.*`
+- `nuxt.config.*`
+- `vue.config.js`
+- `pyproject.toml`
+- `requirements.txt`
+- `Gemfile`
+- `.env*`
+
+Detection is used for:
+
+- bootstrapping `lns.json`
+- choosing a default profile for `lns service add` when you omit `--profile`
+- reporting drift between repo config and detectable repo signals
+
+Detection is not used as steady-state routing truth after `lns.json` exists.
+
+## Sync Semantics
+
+`lns sync` is a read / validate / compile step.
+
+It:
+
+1. loads `lns.json`
+2. validates required fields
+3. blocks on unresolved services
+4. blocks on canonical port conflicts
+5. blocks on hostname conflicts
+6. updates the global registry
+7. regenerates the project and global Caddyfiles
+
+It does not:
+
+- mutate `lns.json`
+- silently reassign ports
+- silently choose a fallback framework or generic port range
+
+If repo signals disagree with `lns.json`, sync reports drift but still compiles from the canonical config.
+
+## Status Output
+
+Inside a repo with `lns.json`, `lns status` shows:
+
+- service status (`resolved` or `unresolved`)
+- source (`detected`, `manual`, or `config`)
+- root
+- port
+- profile
+- explicit hostname
+- drift against detectable repo signals
+
+Outside a repo, or with `--global`, `lns status` shows the compiled global registry view.
+
+## Caddy
+
+`lns` writes:
+
+- `~/.lns/registry.json`
+- `~/.lns/Caddyfile`
+- `~/.lns/projects/*.caddy`
+- `~/.lns/settings.json`
+
+The global Caddyfile imports project-level generated files. `lns start` and `lns reload` operate on that compiled state.
+
+## Docker Export
+
+Compiled projects can still be exported for Docker-based use:
+
+```bash
+lns export my-app -o Caddyfile --upstream docker
+lns export my-app --docker-compose
+```
+
+For Docker upstreams, service entries can include:
+
+- `docker`
+- `container_name`
 
 ## Troubleshooting
 
-### Port 80 permission denied (Linux)
+Service unresolved after `lns init`:
+
+- open `lns.json`
+- fill in the missing `port` or `profile`
+- rerun `lns sync`
+
+Port conflict on `lns sync`:
+
+- run `lns check <port>`
+- inspect `lns status --global`
+- change the canonical repo port in `lns.json`
+
+Drift reported by `lns status` or `lns sync`:
+
+- either update the repo so it matches `lns.json`
+- or update `lns.json` and run `lns sync` again
+
+Caddy not running:
 
 ```bash
-sudo setcap 'cap_net_bind_service=+ep' $(which caddy)
+lns doctor
+lns start
 ```
-
-### Caddy not found
-
-Ensure Caddy is installed and in your PATH:
-```bash
-which caddy
-caddy version
-```
-
-### Service not accessible
-
-1. Check your dev server is running and bound to the correct port
-2. Ensure the port matches what's registered: `lns status`
-3. Reload Caddy: `lns reload`
-4. Check Caddy logs: `journalctl -u caddy` or `caddy run --config ~/.lns/Caddyfile`
-
-### HMR/WebSocket not working
-
-For Vite, configure `vite.config.ts`:
-
-```typescript
-export default defineConfig({
-  server: {
-    host: true,
-    hmr: {
-      host: 'your-app-frontend.localhost',
-      protocol: 'ws',
-    },
-  },
-})
-```
-
-## Configuration Files
-
-| File | Purpose |
-|------|---------|
-| `~/.lns/registry.json` | Global port registry |
-| `~/.lns/settings.json` | Global settings (proxy port, admin address) |
-| `~/.lns/Caddyfile` | Main Caddy config (imports all projects) |
-| `~/.lns/projects/*.caddy` | Per-project Caddy configs |
 
 ## Development
 
 ```bash
-# Build
-make build
-
-# Run tests
-make test
-
-# Build for all platforms
-make build-all
-
-# Install locally
-make install
+env GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./...
 ```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT

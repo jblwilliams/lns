@@ -2,74 +2,73 @@ package models
 
 import "strconv"
 
-type Framework string
+type Profile string
 
 const (
-	FrameworkNextJS   Framework = "nextjs"
-	FrameworkNuxt     Framework = "nuxt"
-	FrameworkVite     Framework = "vite"
-	FrameworkVueCLI   Framework = "vue-cli"
-	FrameworkReactCRA Framework = "react-cra"
-	FrameworkFastAPI  Framework = "fastapi"
-	FrameworkDjango   Framework = "django"
-	FrameworkExpress  Framework = "express"
-	FrameworkRails    Framework = "rails"
-	FrameworkFlask    Framework = "flask"
-	FrameworkGeneric  Framework = "generic"
+	ProfileHMR      Profile = "hmr"
+	ProfileStandard Profile = "standard"
 )
 
-type FrameworkInfo struct {
-	DefaultPort int
-	PortStart   int
-	PortEnd     int
-	NeedsHMR    bool
-}
-
-var Frameworks = map[Framework]FrameworkInfo{
-	FrameworkNextJS:   {DefaultPort: 3000, PortStart: 3000, PortEnd: 3099, NeedsHMR: true},
-	FrameworkNuxt:     {DefaultPort: 3000, PortStart: 3100, PortEnd: 3199, NeedsHMR: true},
-	FrameworkVite:     {DefaultPort: 5173, PortStart: 5173, PortEnd: 5272, NeedsHMR: true},
-	FrameworkVueCLI:   {DefaultPort: 8080, PortStart: 8080, PortEnd: 8099, NeedsHMR: true},
-	FrameworkReactCRA: {DefaultPort: 3000, PortStart: 3200, PortEnd: 3299, NeedsHMR: true},
-	FrameworkFastAPI:  {DefaultPort: 8000, PortStart: 8000, PortEnd: 8079, NeedsHMR: false},
-	FrameworkDjango:   {DefaultPort: 8000, PortStart: 8100, PortEnd: 8179, NeedsHMR: false},
-	FrameworkExpress:  {DefaultPort: 3000, PortStart: 4000, PortEnd: 4099, NeedsHMR: false},
-	FrameworkRails:    {DefaultPort: 3000, PortStart: 4100, PortEnd: 4199, NeedsHMR: false},
-	FrameworkFlask:    {DefaultPort: 5000, PortStart: 5000, PortEnd: 5099, NeedsHMR: false},
-	FrameworkGeneric:  {DefaultPort: 8080, PortStart: 9000, PortEnd: 9099, NeedsHMR: false},
-}
-
-func GetFrameworkInfo(f Framework) FrameworkInfo {
-	if info, ok := Frameworks[f]; ok {
-		return info
-	}
-	return Frameworks[FrameworkGeneric]
-}
-
-func ValidFrameworks() []string {
+func ValidProfiles() []string {
 	return []string{
-		string(FrameworkNextJS),
-		string(FrameworkNuxt),
-		string(FrameworkVite),
-		string(FrameworkVueCLI),
-		string(FrameworkReactCRA),
-		string(FrameworkFastAPI),
-		string(FrameworkDjango),
-		string(FrameworkExpress),
-		string(FrameworkRails),
-		string(FrameworkFlask),
-		string(FrameworkGeneric),
+		string(ProfileHMR),
+		string(ProfileStandard),
 	}
 }
+
+type ServiceSource string
+
+const (
+	SourceConfig   ServiceSource = "config"
+	SourceManual   ServiceSource = "manual"
+	SourceDetected ServiceSource = "detected"
+)
+
+type ServiceStatus string
+
+const (
+	StatusResolved   ServiceStatus = "resolved"
+	StatusUnresolved ServiceStatus = "unresolved"
+)
 
 type Service struct {
-	Name          string    `json:"name" yaml:"name"`
-	Port          int       `json:"port" yaml:"port"`
-	Framework     Framework `json:"framework" yaml:"framework"`
-	Hostname      string    `json:"hostname,omitempty" yaml:"hostname,omitempty"`
-	Docker        bool      `json:"docker,omitempty" yaml:"docker,omitempty"`
-	ContainerName string    `json:"container_name,omitempty" yaml:"container_name,omitempty"`
-	PathPrefix    string    `json:"path_prefix,omitempty" yaml:"path_prefix,omitempty"`
+	Name          string        `json:"name"`
+	Root          string        `json:"root,omitempty"`
+	Port          int           `json:"port,omitempty"`
+	Profile       Profile       `json:"profile,omitempty"`
+	Hostname      string        `json:"hostname,omitempty"`
+	Source        ServiceSource `json:"source,omitempty"`
+	Status        ServiceStatus `json:"status,omitempty"`
+	Docker        bool          `json:"docker,omitempty"`
+	ContainerName string        `json:"container_name,omitempty"`
+}
+
+func (s Service) EffectiveProfile() Profile {
+	if s.Profile == "" {
+		return ProfileStandard
+	}
+	return s.Profile
+}
+
+func (s Service) EffectiveSource() ServiceSource {
+	if s.Source == "" {
+		return SourceConfig
+	}
+	return s.Source
+}
+
+func (s Service) EffectiveStatus() ServiceStatus {
+	if s.Status != "" {
+		return s.Status
+	}
+	if s.Root != "" && s.Port > 0 && s.Profile != "" {
+		return StatusResolved
+	}
+	return StatusUnresolved
+}
+
+func (s Service) IsResolved() bool {
+	return s.EffectiveStatus() == StatusResolved
 }
 
 func (s *Service) GetHostname(projectPrefix string) string {
@@ -91,11 +90,11 @@ func (s *Service) GetDockerUpstream() string {
 }
 
 type Project struct {
-	Name          string    `json:"name" yaml:"name"`
-	Prefix        string    `json:"prefix,omitempty" yaml:"prefix,omitempty"`
-	Path          string    `json:"path,omitempty" yaml:"path,omitempty"`
-	Services      []Service `json:"services" yaml:"services"`
-	DockerNetwork string    `json:"docker_network,omitempty" yaml:"docker_network,omitempty"`
+	Name          string    `json:"name"`
+	Prefix        string    `json:"prefix,omitempty"`
+	Path          string    `json:"path,omitempty"`
+	Services      []Service `json:"services"`
+	DockerNetwork string    `json:"docker_network,omitempty"`
 }
 
 func (p *Project) GetPrefix() string {
@@ -105,16 +104,31 @@ func (p *Project) GetPrefix() string {
 	return p.Name
 }
 
+func (p *Project) GetServiceHostname(service Service) string {
+	if service.Hostname != "" {
+		return service.Hostname
+	}
+
+	prefix := p.GetPrefix()
+	if len(p.Services) == 1 {
+		return prefix + ".localhost"
+	}
+
+	return prefix + "-" + service.Name + ".localhost"
+}
+
 type Registry struct {
-	Version         string             `json:"version"`
-	Projects        map[string]Project `json:"projects"`
-	PortAssignments map[int]string     `json:"port_assignments"`
+	Version             string             `json:"version"`
+	Projects            map[string]Project `json:"projects"`
+	PortAssignments     map[int]string     `json:"port_assignments"`
+	HostnameAssignments map[string]string  `json:"hostname_assignments,omitempty"`
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		Version:         "1.0",
-		Projects:        make(map[string]Project),
-		PortAssignments: make(map[int]string),
+		Version:             "2.0",
+		Projects:            make(map[string]Project),
+		PortAssignments:     make(map[int]string),
+		HostnameAssignments: make(map[string]string),
 	}
 }

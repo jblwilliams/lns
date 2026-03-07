@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"lns/internal/config"
 	"lns/internal/models"
@@ -38,13 +39,7 @@ func Load() (*models.Registry, error) {
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 
-	if reg.Projects == nil {
-		reg.Projects = make(map[string]models.Project)
-	}
-	if reg.PortAssignments == nil {
-		reg.PortAssignments = make(map[int]string)
-	}
-
+	normalizeRegistry(&reg)
 	return &reg, nil
 }
 
@@ -53,48 +48,14 @@ func (m *Manager) Save() error {
 		return err
 	}
 
+	normalizeRegistry(m.Registry)
+
 	data, err := json.MarshalIndent(m.Registry, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(config.GetRegistryPath(), data, 0644)
-}
-
-func (m *Manager) AddProject(name, path, prefix, dockerNetwork string) (*models.Project, error) {
-	if _, exists := m.Registry.Projects[name]; exists {
-		return nil, fmt.Errorf("project '%s' already exists", name)
-	}
-
-	project := models.Project{
-		Name:          name,
-		Path:          path,
-		Prefix:        prefix,
-		DockerNetwork: dockerNetwork,
-		Services:      []models.Service{},
-	}
-
-	m.Registry.Projects[name] = project
-
-	if err := m.Save(); err != nil {
-		return nil, err
-	}
-
-	return &project, nil
-}
-
-func (m *Manager) RemoveProject(name string) error {
-	project, exists := m.Registry.Projects[name]
-	if !exists {
-		return fmt.Errorf("project '%s' not found", name)
-	}
-
-	for _, service := range project.Services {
-		delete(m.Registry.PortAssignments, service.Port)
-	}
-
-	delete(m.Registry.Projects, name)
-	return m.Save()
+	return os.WriteFile(config.GetRegistryPath(), append(data, '\n'), 0644)
 }
 
 func (m *Manager) GetProject(name string) (*models.Project, bool) {
@@ -107,114 +68,86 @@ func (m *Manager) GetProject(name string) (*models.Project, bool) {
 
 func (m *Manager) ListProjects() []models.Project {
 	projects := make([]models.Project, 0, len(m.Registry.Projects))
-	for _, p := range m.Registry.Projects {
-		projects = append(projects, p)
+	for _, project := range m.Registry.Projects {
+		projects = append(projects, project)
 	}
 	return projects
-}
-
-func (m *Manager) AddService(projectName, serviceName string, framework models.Framework, port int, hostname string, docker bool, containerName, pathPrefix string) (*models.Service, int, error) {
-	project, exists := m.Registry.Projects[projectName]
-	if !exists {
-		return nil, 0, fmt.Errorf("project '%s' not found", projectName)
-	}
-
-	for _, s := range project.Services {
-		if s.Name == serviceName {
-			return nil, 0, fmt.Errorf("service '%s' already exists in project '%s'", serviceName, projectName)
-		}
-	}
-
-	assignedPort := port
-	if port == 0 {
-		assignedPort = m.FindAvailablePort(framework)
-	} else {
-		if owner := m.CheckPortConflict(port); owner != "" {
-			return nil, 0, fmt.Errorf("port %d is already in use by %s", port, owner)
-		}
-	}
-
-	service := models.Service{
-		Name:          serviceName,
-		Port:          assignedPort,
-		Framework:     framework,
-		Hostname:      hostname,
-		Docker:        docker,
-		ContainerName: containerName,
-		PathPrefix:    pathPrefix,
-	}
-
-	m.Registry.PortAssignments[assignedPort] = projectName + ":" + serviceName
-	project.Services = append(project.Services, service)
-	m.Registry.Projects[projectName] = project
-
-	if err := m.Save(); err != nil {
-		return nil, 0, err
-	}
-
-	return &service, assignedPort, nil
-}
-
-func (m *Manager) RemoveService(projectName, serviceName string) error {
-	project, exists := m.Registry.Projects[projectName]
-	if !exists {
-		return fmt.Errorf("project '%s' not found", projectName)
-	}
-
-	found := false
-	newServices := make([]models.Service, 0, len(project.Services))
-	for _, s := range project.Services {
-		if s.Name == serviceName {
-			delete(m.Registry.PortAssignments, s.Port)
-			found = true
-		} else {
-			newServices = append(newServices, s)
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("service '%s' not found in project '%s'", serviceName, projectName)
-	}
-
-	project.Services = newServices
-	m.Registry.Projects[projectName] = project
-
-	return m.Save()
 }
 
 func (m *Manager) CheckPortConflict(port int) string {
 	return m.Registry.PortAssignments[port]
 }
 
-func (m *Manager) IsPortAvailable(port int) bool {
-	_, exists := m.Registry.PortAssignments[port]
-	return !exists
-}
-
-func (m *Manager) FindAvailablePort(framework models.Framework) int {
-	info := models.GetFrameworkInfo(framework)
-
-	for port := info.PortStart; port <= info.PortEnd; port++ {
-		if m.IsPortAvailable(port) {
-			return port
-		}
-	}
-
-	for port := 9000; port <= 9999; port++ {
-		if m.IsPortAvailable(port) {
-			return port
-		}
-	}
-
-	return 9999
+func (m *Manager) CheckHostnameConflict(hostname string) string {
+	return m.Registry.HostnameAssignments[strings.ToLower(strings.TrimSpace(hostname))]
 }
 
 func (m *Manager) GetAllPortAssignments() map[int]string {
-	result := make(map[int]string)
-	for k, v := range m.Registry.PortAssignments {
-		result[k] = v
+	result := make(map[int]string, len(m.Registry.PortAssignments))
+	for port, owner := range m.Registry.PortAssignments {
+		result[port] = owner
 	}
 	return result
+}
+
+func (m *Manager) RemoveProject(name string) error {
+	if _, exists := m.Registry.Projects[name]; !exists {
+		return fmt.Errorf("project %q not found", name)
+	}
+
+	delete(m.Registry.Projects, name)
+	rebuildAssignments(m.Registry)
+	return m.Save()
+}
+
+func (m *Manager) UpsertProject(project models.Project) error {
+	if project.Name == "" {
+		return fmt.Errorf("project name is required")
+	}
+
+	normalizeProject(&project)
+	m.Registry.Projects[project.Name] = project
+	rebuildAssignments(m.Registry)
+	return m.Save()
+}
+
+func (m *Manager) ValidateProjectConflicts(project models.Project) []error {
+	normalizeProject(&project)
+
+	snapshot := cloneRegistry(m.Registry)
+	delete(snapshot.Projects, project.Name)
+	rebuildAssignments(snapshot)
+
+	var errs []error
+	seenPorts := map[int]string{}
+	seenHostnames := map[string]string{}
+	for _, service := range project.Services {
+		if !service.IsResolved() {
+			errs = append(errs, fmt.Errorf("service %q is unresolved", service.Name))
+			continue
+		}
+
+		if owner := seenPorts[service.Port]; owner != "" {
+			errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
+		} else {
+			seenPorts[service.Port] = project.Name + ":" + service.Name
+		}
+		if owner := snapshot.PortAssignments[service.Port]; owner != "" {
+			errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
+		}
+
+		hostname := strings.ToLower(project.GetServiceHostname(service))
+		if owner := seenHostnames[hostname]; owner != "" {
+			errs = append(errs, fmt.Errorf("hostname %q is already owned by %s", hostname, owner))
+		} else {
+			seenHostnames[hostname] = project.Name + ":" + service.Name
+		}
+		if owner := snapshot.HostnameAssignments[hostname]; owner != "" {
+			errs = append(errs, fmt.Errorf("hostname %q is already owned by %s", hostname, owner))
+		}
+	}
+
+	return errs
 }
 
 type PortInfo struct {
@@ -225,7 +158,6 @@ type PortInfo struct {
 
 func (m *Manager) GetPortList() []PortInfo {
 	ports := make([]PortInfo, 0, len(m.Registry.PortAssignments))
-
 	for port, owner := range m.Registry.PortAssignments {
 		project, service := parseOwner(owner)
 		ports = append(ports, PortInfo{
@@ -251,19 +183,69 @@ func parseOwner(owner string) (project, service string) {
 	return owner, ""
 }
 
-func (m *Manager) SuggestPort(framework models.Framework) (int, int, int) {
-	info := models.GetFrameworkInfo(framework)
-	port := m.FindAvailablePort(framework)
-	return port, info.PortStart, info.PortEnd
-}
-
-func (m *Manager) UpdateProjectPath(name, path string) error {
-	project, exists := m.Registry.Projects[name]
-	if !exists {
-		return fmt.Errorf("project '%s' not found", name)
+func normalizeRegistry(reg *models.Registry) {
+	if reg.Version == "" {
+		reg.Version = "2.0"
+	}
+	if reg.Projects == nil {
+		reg.Projects = make(map[string]models.Project)
+	}
+	if reg.PortAssignments == nil {
+		reg.PortAssignments = make(map[int]string)
+	}
+	if reg.HostnameAssignments == nil {
+		reg.HostnameAssignments = make(map[string]string)
 	}
 
-	project.Path = path
-	m.Registry.Projects[name] = project
-	return m.Save()
+	for name, project := range reg.Projects {
+		if project.Name == "" {
+			project.Name = name
+		}
+		normalizeProject(&project)
+		reg.Projects[name] = project
+	}
+
+	rebuildAssignments(reg)
+}
+
+func normalizeProject(project *models.Project) {
+	sort.Slice(project.Services, func(i, j int) bool {
+		return project.Services[i].Name < project.Services[j].Name
+	})
+}
+
+func rebuildAssignments(reg *models.Registry) {
+	reg.PortAssignments = make(map[int]string)
+	reg.HostnameAssignments = make(map[string]string)
+
+	projectNames := make([]string, 0, len(reg.Projects))
+	for name := range reg.Projects {
+		projectNames = append(projectNames, name)
+	}
+	sort.Strings(projectNames)
+
+	for _, projectName := range projectNames {
+		project := reg.Projects[projectName]
+
+		for _, service := range project.Services {
+			if !service.IsResolved() {
+				continue
+			}
+
+			reg.PortAssignments[service.Port] = projectName + ":" + service.Name
+			reg.HostnameAssignments[strings.ToLower(project.GetServiceHostname(service))] = projectName + ":" + service.Name
+		}
+	}
+}
+
+func cloneRegistry(reg *models.Registry) *models.Registry {
+	clone := models.NewRegistry()
+	clone.Version = reg.Version
+	for name, project := range reg.Projects {
+		projectClone := project
+		projectClone.Services = append([]models.Service(nil), project.Services...)
+		clone.Projects[name] = projectClone
+	}
+	rebuildAssignments(clone)
+	return clone
 }
