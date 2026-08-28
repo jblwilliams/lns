@@ -15,7 +15,6 @@ import (
 	"lns/internal/devrun"
 	"lns/internal/discovery"
 	"lns/internal/models"
-	"lns/internal/projectconfig"
 )
 
 const SchemaVersion = 1
@@ -31,7 +30,6 @@ type PortStrategy string
 
 const (
 	PortDynamic    PortStrategy = "dynamic"
-	PortFixed      PortStrategy = "fixed"
 	PortUnresolved PortStrategy = "unresolved"
 )
 
@@ -39,7 +37,6 @@ type ServiceState string
 
 const (
 	StateManaged    ServiceState = "managed"
-	StateExternal   ServiceState = "external"
 	StateUnresolved ServiceState = "unresolved"
 )
 
@@ -65,15 +62,24 @@ type Project struct {
 type Service struct {
 	Name        string               `json:"name"`
 	Root        string               `json:"root"`
+	RunRoot     string               `json:"run_root,omitempty"`
 	Script      string               `json:"script,omitempty"`
 	Command     []string             `json:"command,omitempty"`
-	Profile     models.Profile       `json:"profile"`
 	State       ServiceState         `json:"state"`
-	Hostname    string               `json:"hostname"`
-	URL         string               `json:"url"`
-	Port        Port                 `json:"port"`
+	Default     bool                 `json:"default"`
+	Listeners   []Listener           `json:"listeners"`
 	Environment []EnvironmentBinding `json:"environment,omitempty"`
 	Evidence    []string             `json:"evidence"`
+}
+
+type Listener struct {
+	Name        string         `json:"name"`
+	Profile     models.Profile `json:"profile"`
+	Public      bool           `json:"public"`
+	Hostname    string         `json:"hostname,omitempty"`
+	URL         string         `json:"url,omitempty"`
+	Environment []string       `json:"environment"`
+	Port        Port           `json:"port"`
 }
 
 type BindingKind string
@@ -84,16 +90,29 @@ const (
 )
 
 type EnvironmentBinding struct {
-	Name     string      `json:"name"`
-	Kind     BindingKind `json:"kind"`
-	Target   string      `json:"target"`
-	Path     string      `json:"path,omitempty"`
-	Evidence string      `json:"evidence"`
+	Name     string         `json:"name"`
+	Kind     BindingKind    `json:"kind"`
+	Target   EndpointRef    `json:"target"`
+	Scheme   string         `json:"scheme,omitempty"`
+	Path     string         `json:"path,omitempty"`
+	Evidence string         `json:"evidence"`
+	Network  BindingNetwork `json:"network"`
 }
+
+type EndpointRef struct {
+	Service  string `json:"service"`
+	Listener string `json:"listener"`
+}
+
+type BindingNetwork string
+
+const (
+	NetworkRoute    BindingNetwork = "route"
+	NetworkLoopback BindingNetwork = "loopback"
+)
 
 type Port struct {
 	Strategy PortStrategy   `json:"strategy"`
-	Fixed    int            `json:"fixed,omitempty"`
 	Observed []ObservedPort `json:"observed,omitempty"`
 }
 
@@ -135,27 +154,32 @@ func Build(root string, route Route) (Plan, error) {
 		port string
 	}
 	var evidenceByService map[string]evidence
-	if projectconfig.Exists(absRoot) {
-		cfg, err := projectconfig.Load(absRoot)
+	runRootByService := map[string]string{}
+	if configExists(absRoot) {
+		configured, err := loadConfigProject(absRoot)
 		if err != nil {
-			return Plan{}, fmt.Errorf("load %s: %w", projectconfig.Filename, err)
+			return Plan{}, fmt.Errorf("load %s: %w", configFilename, err)
 		}
-		if errs := projectconfig.Validate(cfg); len(errs) > 0 {
-			return Plan{}, fmt.Errorf("invalid %s: %s", projectconfig.Filename, joinValidationErrors(errs))
-		}
-		name = cfg.Name
+		name = configured.Name
 		source = SourceConfig
-		compiled = cfg.ToProject(absRoot)
+		compiled = configured
 	} else {
 		detected := discovery.DetectServices(absRoot)
+		wrappers := rootWrappers(absRoot, detected)
 		evidenceByService = make(map[string]evidence, len(detected))
-		compiled = models.Project{Name: name, Path: absRoot, Services: make([]models.Service, 0, len(detected))}
+		compiled = models.Project{Name: name, Services: make([]models.Service, 0, len(detected))}
 		for _, service := range detected {
 			if len(detected) == 1 && service.Root == "." {
 				service.Name = name
 			}
+			serviceEvidence := append([]string(nil), service.Evidence...)
+			if wrapper, ok := wrappers[service.Name]; ok {
+				service.Script = wrapper.Script
+				runRootByService[service.Name] = "."
+				serviceEvidence = append(serviceEvidence, "package.json script "+wrapper.Script+" (root wrapper)")
+			}
 			evidenceByService[service.Name] = evidence{
-				all:  append([]string(nil), service.Evidence...),
+				all:  serviceEvidence,
 				port: service.PortEvidence,
 			}
 			compiled.Services = append(compiled.Services, models.Service{
@@ -164,11 +188,12 @@ func Build(root string, route Route) (Plan, error) {
 				Port:    service.Port,
 				Script:  service.Script,
 				Profile: service.Profile,
-				Source:  service.Source,
 				Status:  service.Status,
 			})
 		}
 	}
+	defaults := defaultServices(compiled.Services, source)
+	defaultCount := len(defaults)
 
 	plan := Plan{
 		SchemaVersion: SchemaVersion,
@@ -182,54 +207,71 @@ func Build(root string, route Route) (Plan, error) {
 		Warnings: []Warning{},
 	}
 	for _, service := range compiled.Services {
-		hostname := devrun.ApplyWorktreePrefix(compiled.GetServiceHostname(service), plan.Project.Worktree)
 		serviceEvidence := evidenceByService[service.Name]
 		if source == SourceConfig {
-			serviceEvidence = evidence{all: []string{projectconfig.Filename}, port: projectconfig.Filename}
+			serviceEvidence = evidence{all: []string{configFilename}, port: configFilename}
 		}
 		serviceEvidence.all = stableStrings(serviceEvidence.all)
 		state := serviceState(service)
+		isDefault := defaults[service.Name]
+		hostname := compiled.GetServiceHostname(service)
+		if isDefault && defaultCount == 1 && service.Hostname == "" {
+			hostname = compiled.GetPrefix() + ".localhost"
+		}
+		hostname = devrun.ApplyWorktreePrefix(hostname, plan.Project.Worktree)
 		port := Port{Strategy: PortDynamic}
 		if service.Port > 0 {
 			port.Observed = []ObservedPort{{Value: service.Port, Evidence: serviceEvidence.port}}
 		}
 		switch state {
 		case StateManaged:
-		case StateExternal:
-			port.Strategy = PortFixed
-			port.Fixed = service.Port
 		case StateUnresolved:
 			port.Strategy = PortUnresolved
 		default:
 			panic(fmt.Sprintf("unhandled service state %q", state))
 		}
 		plan.Services = append(plan.Services, Service{
-			Name:     service.Name,
-			Root:     service.Root,
-			Script:   service.Script,
-			Command:  append([]string(nil), service.Command...),
-			Profile:  service.EffectiveProfile(),
-			State:    state,
-			Hostname: hostname,
-			URL:      route.url(hostname),
-			Port:     port,
+			Name:    service.Name,
+			Root:    service.Root,
+			RunRoot: runRootByService[service.Name],
+			Script:  service.Script,
+			Command: append([]string(nil), service.Command...),
+			State:   state,
+			Default: isDefault,
+			Listeners: []Listener{{
+				Name: "http", Profile: service.EffectiveProfile(), Public: true,
+				Hostname: hostname, URL: route.url(hostname),
+				Environment: publicPortEnvironment(absRoot, service), Port: port,
+			}},
 			Evidence: serviceEvidence.all,
 		})
-		if state == StateUnresolved {
-			recovery := "run `lns init`, then resolve the service explicitly"
-			if source == SourceConfig {
-				recovery = "edit lns.json and set a valid profile plus script, command, or port"
-			}
+		if state == StateUnresolved && source == SourceConfig {
 			plan.Warnings = append(plan.Warnings, Warning{
 				Code:     "unresolved-service",
 				Message:  fmt.Sprintf("service %q is unresolved and will not run", service.Name),
-				Recovery: recovery,
+				Recovery: "edit lns.json and set a valid profile plus script, command, or port",
 			})
 		}
 	}
 
 	sort.Slice(plan.Services, func(i, j int) bool { return plan.Services[i].Name < plan.Services[j].Name })
-	inferEnvironment(absRoot, &plan)
+	inferListeners(absRoot, &plan)
+	inferEnvironment(absRoot, route, &plan)
+	managed, selectedByDefault := 0, 0
+	for _, service := range plan.Services {
+		if service.State == StateManaged {
+			managed++
+		}
+		if service.Default {
+			selectedByDefault++
+		}
+	}
+	if managed > 0 && selectedByDefault == 0 {
+		plan.Warnings = append(plan.Warnings, Warning{
+			Code: "ambiguous-default", Message: "multiple runnable services exist but no default app entrypoint is unambiguous",
+			Recovery: "choose one explicitly with `lns run <service>`",
+		})
+	}
 	if len(plan.Services) == 0 {
 		plan.Warnings = append(plan.Warnings, Warning{
 			Code:     "no-services",
@@ -288,22 +330,11 @@ func stableStrings(values []string) []string {
 	return result
 }
 
-func joinValidationErrors(errs []projectconfig.ValidationError) string {
-	messages := make([]string, len(errs))
-	for i, err := range errs {
-		messages[i] = err.Error()
-	}
-	return strings.Join(messages, "; ")
-}
-
 func serviceState(service models.Service) ServiceState {
-	if !service.IsResolved() {
+	if !service.IsResolved() || !service.CanRun() {
 		return StateUnresolved
 	}
-	if service.CanRun() {
-		return StateManaged
-	}
-	return StateExternal
+	return StateManaged
 }
 
 func (route Route) normalized() (Route, error) {

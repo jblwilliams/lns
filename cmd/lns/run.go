@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 
 	"lns/internal/caddy"
 	"lns/internal/config"
+	"lns/internal/dependencyruntime"
 	"lns/internal/devrun"
 	"lns/internal/devruntime"
 	"lns/internal/models"
@@ -25,28 +27,21 @@ type serviceRun struct {
 	Root    string
 	Command []string
 	URL     string
-	Lease   devruntime.Lease
+	Leases  []devruntime.Lease
 	Env     []string
 }
 
 var runCmd = &cobra.Command{
 	Use:   "run [service] [-- command...]",
 	Short: "Run one service on a dynamic port through the local proxy",
-	Args:  cobra.ArbitraryArgs,
-	RunE:  runOneCommand,
-}
-
-var upCmd = &cobra.Command{
-	Use:   "up",
-	Short: "Run all configured development services",
-	Args:  cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runConfiguredServices(nil, nil, 0)
-	},
+	Example: `  lns run web
+  lns run api -- pnpm run dev:api`,
+	Args: cobra.ArbitraryArgs,
+	RunE: runOneCommand,
 }
 
 func init() {
-	rootCmd.AddCommand(runCmd, upCmd)
+	rootCmd.AddCommand(runCmd)
 	rootCmd.RunE = func(cmd *cobra.Command, args []string) error {
 		return runConfiguredServices(nil, nil, 0)
 	}
@@ -82,7 +77,7 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	if err != nil {
 		return err
 	}
-	plan, err := buildRunPlan(root, settings)
+	plan, err := buildRunPlan(root)
 	if err != nil {
 		return err
 	}
@@ -107,11 +102,31 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 		names = runnableServiceNames(plan)
 	}
 	if len(names) == 0 {
-		return fmt.Errorf("no managed services; run `lns plan` to inspect discovery and recovery steps")
+		return fmt.Errorf("no unambiguous default services; run `lns plan`, then choose one with `lns run <service>`")
 	}
 	if requestedPort > 0 && len(names) != 1 {
 		return fmt.Errorf("--port can only be used when running one service")
 	}
+	selected, err := servicesByName(plan, names)
+	if err != nil {
+		return err
+	}
+	for _, service := range selected {
+		if service.State != projectplan.StateManaged {
+			return fmt.Errorf("service %q is %s and cannot be started; run `lns plan` for recovery", service.Name, service.State)
+		}
+	}
+	dependencies, err := dependencyruntime.Start(context.Background(), dependencyruntime.Request{
+		Root: root, Project: plan.Project.Name, Worktree: plan.Project.Worktree, Services: selected,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := dependencies.Close(context.Background()); err != nil {
+			printWarning("Could not stop Docker dependencies: %v", err)
+		}
+	}()
 
 	store := devruntime.NewStore()
 	activeLeases, err := store.Load()
@@ -120,51 +135,55 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	}
 	runs := make([]serviceRun, 0, len(names))
 	usedPorts := map[int]bool{}
-	ports := make(map[string]int, len(names))
+	ports := make(map[string]int)
 	for _, lease := range activeLeases {
 		usedPorts[lease.Port] = true
-	}
-	for _, name := range names {
-		port := requestedPort
-		if port == 0 {
-			for attempts := 0; attempts < 10; attempts++ {
-				port, err = devrun.FindFreePort()
-				if err != nil {
-					return fmt.Errorf("find port for %s: %w", name, err)
-				}
-				if !usedPorts[port] {
-					break
-				}
-			}
-			if usedPorts[port] {
-				return fmt.Errorf("could not reserve a unique port for %s", name)
-			}
-		}
-		usedPorts[port] = true
-		ports[name] = port
 	}
 	for _, name := range names {
 		service, err := serviceByName(plan, name)
 		if err != nil {
 			return err
 		}
-		if service.State != projectplan.StateManaged {
-			return fmt.Errorf("service %q is %s and cannot be started; run `lns plan` for recovery", name, service.State)
+		for _, listener := range service.Listeners {
+			port := 0
+			if requestedPort > 0 && listener.Public {
+				port = requestedPort
+			}
+			if port == 0 {
+				port, err = allocatePort(usedPorts)
+				if err != nil {
+					return fmt.Errorf("find port for %s/%s: %w", name, listener.Name, err)
+				}
+			}
+			if usedPorts[port] {
+				return fmt.Errorf("port %d is already reserved", port)
+			}
+			usedPorts[port] = true
+			ports[projectplan.EndpointKey(projectplan.EndpointRef{Service: name, Listener: listener.Name})] = port
+		}
+	}
+	for _, name := range names {
+		service, err := serviceByName(plan, name)
+		if err != nil {
+			return err
 		}
 		run, err := prepareServiceRun(root, plan, service, ports, os.Getpid())
 		if err != nil {
 			return fmt.Errorf("prepare %s: %w", name, err)
 		}
+		run.Env = devrun.OverlayEnvironment(run.Env, dependencies.Overrides(name))
 		runs = append(runs, run)
 	}
 
 	registered := make([]serviceRun, 0, len(runs))
 	for _, run := range runs {
-		if err := store.Add(run.Lease); err != nil {
-			cleanupRuns(store, registered, settings)
-			return err
+		for _, lease := range run.Leases {
+			if err := store.Add(lease); err != nil {
+				cleanupRuns(store, registered, settings)
+				return err
+			}
+			registered = append(registered, serviceRun{Name: run.Name, Leases: []devruntime.Lease{lease}})
 		}
-		registered = append(registered, run)
 	}
 	if err := ensureProxyReady(settings); err != nil {
 		cleanupRuns(store, registered, settings)
@@ -180,44 +199,77 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 }
 
 func prepareServiceRun(projectRoot string, plan projectplan.Plan, service projectplan.Service, ports map[string]int, pid int) (serviceRun, error) {
-	port, ok := ports[service.Name]
+	public, ok := publicListener(service)
 	if !ok {
-		return serviceRun{}, fmt.Errorf("service %q has no allocated port", service.Name)
+		return serviceRun{}, fmt.Errorf("service %q has no public listener", service.Name)
+	}
+	port, ok := ports[projectplan.EndpointKey(projectplan.EndpointRef{Service: service.Name, Listener: public.Name})]
+	if !ok {
+		return serviceRun{}, fmt.Errorf("service %q has no allocated public port", service.Name)
+	}
+	runRoot := service.Root
+	if service.RunRoot != "" {
+		runRoot = service.RunRoot
 	}
 	model := models.Service{
-		Name: service.Name, Root: service.Root, Script: service.Script,
-		Command: append([]string(nil), service.Command...), Profile: service.Profile,
+		Name: service.Name, Root: runRoot, Script: service.Script,
+		Command: append([]string(nil), service.Command...), Profile: public.Profile,
 		Status: models.StatusResolved,
 	}
 	command, err := devrun.ResolveCommand(projectRoot, model, port)
 	if err != nil {
 		return serviceRun{}, err
 	}
-	overrides := map[string]string{"HOST": "127.0.0.1", "LNS_URL": service.URL}
-	for _, value := range devrun.PortEnvironment(projectRoot, model, port) {
-		key, value, _ := strings.Cut(value, "=")
-		overrides[key] = value
+	overrides := map[string]string{"HOST": "127.0.0.1", "LNS_URL": public.URL, "LNS_PORT": fmt.Sprint(port)}
+	for _, listener := range service.Listeners {
+		listenerPort, exists := ports[projectplan.EndpointKey(projectplan.EndpointRef{Service: service.Name, Listener: listener.Name})]
+		if !exists {
+			return serviceRun{}, fmt.Errorf("service %q listener %q has no allocated port", service.Name, listener.Name)
+		}
+		for _, name := range listener.Environment {
+			overrides[name] = fmt.Sprint(listenerPort)
+		}
 	}
+	overrides[devrun.EnvironmentName(service.Name)+"_PORT"] = fmt.Sprint(port)
 	for _, related := range plan.Services {
+		relatedListener, exists := publicListener(related)
+		if !exists {
+			continue
+		}
 		key := devrun.EnvironmentName(related.Name)
-		overrides["LNS_"+key+"_URL"] = related.URL
-		overrides["VITE_LNS_"+key+"_URL"] = related.URL
-		if relatedPort, exists := ports[related.Name]; exists {
+		overrides["LNS_"+key+"_URL"] = relatedListener.URL
+		overrides["VITE_LNS_"+key+"_URL"] = relatedListener.URL
+		if relatedPort, exists := ports[projectplan.EndpointKey(projectplan.EndpointRef{Service: related.Name, Listener: relatedListener.Name})]; exists {
 			overrides[key+"_PORT"] = fmt.Sprint(relatedPort)
 		}
 	}
 	for _, binding := range service.Environment {
 		switch binding.Kind {
 		case projectplan.BindingPort:
-			if targetPort, exists := ports[binding.Target]; exists {
+			if targetPort, exists := ports[projectplan.EndpointKey(binding.Target)]; exists {
 				overrides[binding.Name] = fmt.Sprint(targetPort)
 			}
 		case projectplan.BindingURL:
-			target, err := serviceByName(plan, binding.Target)
+			target, err := serviceByName(plan, binding.Target.Service)
 			if err != nil {
 				return serviceRun{}, err
 			}
-			overrides[binding.Name] = strings.TrimSuffix(target.URL, "/") + binding.Path
+			targetListener, ok := listenerByName(target, binding.Target.Listener)
+			if !ok {
+				return serviceRun{}, fmt.Errorf("listener %s/%s is not in the project plan", binding.Target.Service, binding.Target.Listener)
+			}
+			if binding.Network == projectplan.NetworkLoopback {
+				targetPort, exists := ports[projectplan.EndpointKey(binding.Target)]
+				if exists {
+					scheme := binding.Scheme
+					if scheme == "" {
+						scheme = "http"
+					}
+					overrides[binding.Name] = fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, targetPort, binding.Path)
+				}
+			} else {
+				overrides[binding.Name] = strings.TrimSuffix(targetListener.URL, "/") + binding.Path
+			}
 		default:
 			return serviceRun{}, fmt.Errorf("unsupported environment binding %q", binding.Kind)
 		}
@@ -225,35 +277,31 @@ func prepareServiceRun(projectRoot string, plan projectplan.Plan, service projec
 	env := devrun.OverlayEnvironment(os.Environ(), overrides)
 	return serviceRun{
 		Name:    service.Name,
-		Root:    filepath.Join(projectRoot, service.Root),
+		Root:    filepath.Join(projectRoot, runRoot),
 		Command: command,
-		URL:     service.URL + "/",
-		Lease: devruntime.Lease{
+		URL:     public.URL + "/",
+		Leases: []devruntime.Lease{{
 			Project:  plan.Project.Name,
 			Service:  service.Name,
-			Root:     filepath.Join(projectRoot, service.Root),
-			Hostname: service.Hostname,
+			Root:     filepath.Join(projectRoot, runRoot),
+			Hostname: public.Hostname,
 			Port:     port,
 			PID:      pid,
 			Worktree: plan.Project.Worktree,
-			Profile:  model.Profile,
-		},
+			Profile:  public.Profile,
+		}},
 		Env: env,
 	}, nil
 }
 
-func buildRunPlan(root string, settings config.Settings) (projectplan.Plan, error) {
-	scheme := "http"
-	if settings.HTTPS {
-		scheme = "https"
-	}
-	return projectplan.Build(root, projectplan.Route{Scheme: scheme, Port: settings.HTTPPort})
+func buildRunPlan(root string) (projectplan.Plan, error) {
+	return projectplan.Build(root, projectplan.Route{Scheme: "http", Port: config.DefaultHTTPPort})
 }
 
 func runnableServiceNames(plan projectplan.Plan) []string {
 	var names []string
 	for _, service := range plan.Services {
-		if service.State == projectplan.StateManaged {
+		if service.State == projectplan.StateManaged && service.Default {
 			names = append(names, service.Name)
 		}
 	}
@@ -285,6 +333,49 @@ func serviceByName(plan projectplan.Plan, name string) (projectplan.Service, err
 	return projectplan.Service{}, fmt.Errorf("service %q is not in the project plan", name)
 }
 
+func servicesByName(plan projectplan.Plan, names []string) ([]projectplan.Service, error) {
+	result := make([]projectplan.Service, 0, len(names))
+	for _, name := range names {
+		service, err := serviceByName(plan, name)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, service)
+	}
+	return result, nil
+}
+
+func publicListener(service projectplan.Service) (projectplan.Listener, bool) {
+	for _, listener := range service.Listeners {
+		if listener.Public {
+			return listener, true
+		}
+	}
+	return projectplan.Listener{}, false
+}
+
+func listenerByName(service projectplan.Service, name string) (projectplan.Listener, bool) {
+	for _, listener := range service.Listeners {
+		if listener.Name == name {
+			return listener, true
+		}
+	}
+	return projectplan.Listener{}, false
+}
+
+func allocatePort(used map[int]bool) (int, error) {
+	for attempts := 0; attempts < 10; attempts++ {
+		port, err := devrun.FindFreePort()
+		if err != nil {
+			return 0, err
+		}
+		if !used[port] {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("could not reserve a unique port")
+}
+
 func replaceService(plan *projectplan.Plan, replacement projectplan.Service) {
 	for index := range plan.Services {
 		if plan.Services[index].Name == replacement.Name {
@@ -295,26 +386,24 @@ func replaceService(plan *projectplan.Plan, replacement projectplan.Service) {
 }
 
 func ensureProxyReady(settings config.Settings) error {
-	if _, err := exec.LookPath("caddy"); err != nil {
+	caddyPath, err := exec.LookPath("caddy")
+	if err != nil {
 		return fmt.Errorf("Caddy is not installed or not in PATH")
 	}
 	if _, err := caddy.RegenerateAllCaddyfiles(); err != nil {
 		return fmt.Errorf("generate Caddy config: %w", err)
 	}
 	global := config.GetGlobalCaddyfilePath()
-	var command *exec.Cmd
 	if isTCPListening(settings.AdminAddr) {
-		command = exec.Command("caddy", "reload", "--config", global, "--address", settings.AdminAddr)
-	} else {
-		command = exec.Command("caddy", "start", "--config", global)
-		detachProcess(command)
+		command := exec.Command(caddyPath, "reload", "--config", global, "--address", settings.AdminAddr)
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("reload Caddy: %w", err)
+		}
+		return nil
 	}
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("start or reload Caddy: %w", err)
-	}
-	return nil
+	return startCaddy(caddyPath, global, config.DefaultHTTPPort)
 }
 
 func executeRuns(runs []serviceRun) error {
@@ -378,8 +467,10 @@ func interruptCommands(commands []*exec.Cmd) {
 
 func cleanupRuns(store *devruntime.Store, runs []serviceRun, settings config.Settings) {
 	for _, run := range runs {
-		if err := store.Remove(run.Lease.Project, run.Lease.Service, run.Lease.Worktree, run.Lease.PID); err != nil {
-			printWarning("Could not remove runtime route for %s: %v", run.Name, err)
+		for _, lease := range run.Leases {
+			if err := store.Remove(lease.Project, lease.Service, lease.Worktree, lease.PID); err != nil {
+				printWarning("Could not remove runtime route for %s: %v", run.Name, err)
+			}
 		}
 	}
 	if _, err := caddy.RegenerateAllCaddyfiles(); err != nil {

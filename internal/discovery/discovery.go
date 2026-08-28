@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"lns/internal/models"
-	"lns/internal/projectconfig"
 )
 
 var (
@@ -28,53 +27,7 @@ type DetectedService struct {
 	Script       string
 	Profile      models.Profile
 	Status       models.ServiceStatus
-	Source       models.ServiceSource
 	Evidence     []string
-}
-
-type Drift struct {
-	Service    string
-	Field      string
-	Configured string
-	Detected   string
-	Evidence   string
-}
-
-func BootstrapConfig(projectName, projectRoot, prefix string) *projectconfig.Config {
-	cfg := &projectconfig.Config{
-		Name:     projectName,
-		Prefix:   prefix,
-		Services: map[string]projectconfig.Service{},
-	}
-
-	detected := DetectServices(projectRoot)
-	if len(detected) == 0 {
-		detected = []DetectedService{{
-			Name:     serviceNameOrFallback(projectName),
-			Root:     ".",
-			Status:   models.StatusUnresolved,
-			Source:   models.SourceDetected,
-			Evidence: []string{"no services detected from common repo signals"},
-		}}
-	} else if len(detected) == 1 && detected[0].Root == "." {
-		if name := NormalizeName(projectName); name != "" {
-			detected[0].Name = name
-		}
-	}
-
-	for _, service := range detected {
-		cfg.Services[service.Name] = projectconfig.Service{
-			Root:    service.Root,
-			Port:    service.Port,
-			Script:  service.Script,
-			Profile: service.Profile,
-			Source:  service.Source,
-			Status:  service.Status,
-		}
-	}
-
-	cfg.Normalize()
-	return cfg
 }
 
 func DetectServices(projectRoot string) []DetectedService {
@@ -106,45 +59,6 @@ func DetectServices(projectRoot string) []DetectedService {
 	})
 
 	return services
-}
-
-func DetectDrift(projectRoot string, cfg *projectconfig.Config) []Drift {
-	cfg.Normalize()
-
-	var drifts []Drift
-	for _, name := range cfg.SortedServiceNames() {
-		service := cfg.Services[name]
-		root := service.Root
-		if root == "" {
-			root = "."
-		}
-
-		detected, ok := inspectRoot(projectRoot, root)
-		if !ok {
-			continue
-		}
-
-		if service.Port > 0 && detected.Port > 0 && service.Port != detected.Port {
-			drifts = append(drifts, Drift{
-				Service:    name,
-				Field:      "port",
-				Configured: itoa(service.Port),
-				Detected:   itoa(detected.Port),
-				Evidence:   strings.Join(detected.Evidence, ", "),
-			})
-		}
-		if service.Profile != "" && detected.Profile != "" && service.Profile != detected.Profile {
-			drifts = append(drifts, Drift{
-				Service:    name,
-				Field:      "profile",
-				Configured: string(service.Profile),
-				Detected:   string(detected.Profile),
-				Evidence:   strings.Join(detected.Evidence, ", "),
-			})
-		}
-	}
-
-	return drifts
 }
 
 func InspectServiceRoot(projectRoot, relRoot string) (DetectedService, bool) {
@@ -247,7 +161,6 @@ func inspectRoot(projectRoot, relRoot string) (DetectedService, bool) {
 		Script:       script,
 		Profile:      profile,
 		Status:       status,
-		Source:       models.SourceDetected,
 		Evidence:     evidence,
 	}, true
 }
@@ -309,7 +222,6 @@ func detectSiblingScriptServices(projectRoot, relRoot, primaryScript string) []D
 			Script:       candidate.script,
 			Profile:      models.ProfileStandard,
 			Status:       models.StatusResolved,
-			Source:       models.SourceDetected,
 			Evidence:     []string{"package.json script " + candidate.script},
 		})
 	}

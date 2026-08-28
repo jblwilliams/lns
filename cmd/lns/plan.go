@@ -25,12 +25,7 @@ processes, prune leases, or reload the proxy.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		root, _ := cmd.Flags().GetString("path")
 		jsonOutput, _ := cmd.Flags().GetBool("json")
-		settings := loadSettingsOrDefault()
-		scheme := "http"
-		if settings.HTTPS {
-			scheme = "https"
-		}
-		return runPlan(cmd.OutOrStdout(), root, jsonOutput, projectplan.Route{Scheme: scheme, Port: settings.HTTPPort})
+		return runPlan(cmd.OutOrStdout(), root, jsonOutput, projectplan.Route{Scheme: "http", Port: 80})
 	},
 }
 
@@ -59,7 +54,7 @@ func writePlan(output io.Writer, plan projectplan.Plan, jsonOutput bool) error {
 		return err
 	}
 	writer := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(writer, "SERVICE\tSTATE\tCOMMAND\tLOCAL NAME\tPORT"); err != nil {
+	if _, err := fmt.Fprintln(writer, "SERVICE\tDEFAULT\tSTATE\tCOMMAND\tLOCAL NAME\tPORT"); err != nil {
 		return err
 	}
 	for _, service := range plan.Services {
@@ -67,12 +62,22 @@ func writePlan(output io.Writer, plan projectplan.Plan, jsonOutput bool) error {
 		if service.Script != "" {
 			command = "package script " + service.Script
 		}
-		port := string(service.Port.Strategy)
-		if service.Port.Strategy == projectplan.PortFixed {
-			port = fmt.Sprintf("%d", service.Port.Fixed)
-		}
-		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", service.Name, service.State, command, service.URL, port); err != nil {
-			return err
+		for index, listener := range service.Listeners {
+			port := string(listener.Port.Strategy)
+			name := service.Name
+			if len(service.Listeners) > 1 {
+				name += "/" + listener.Name
+			}
+			defaultValue := ""
+			if service.Default {
+				defaultValue = "yes"
+			}
+			if index > 0 {
+				command = ""
+			}
+			if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", name, defaultValue, service.State, command, listener.URL, port); err != nil {
+				return err
+			}
 		}
 	}
 	if err := writer.Flush(); err != nil {

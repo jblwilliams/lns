@@ -4,25 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"testing"
 
-	"lns/internal/caddy"
-	"lns/internal/config"
 	"lns/internal/models"
-	"lns/internal/projectconfig"
 	"lns/internal/projectplan"
 )
-
-func TestExportCommandDefaultsToContainerHTTPPort(t *testing.T) {
-	flag := exportCmd.Flags().Lookup("proxy-port")
-	if flag == nil {
-		t.Fatal("expected export --proxy-port flag")
-	}
-	if flag.DefValue != strconv.Itoa(80) {
-		t.Fatalf("expected Docker export port 80, got %s", flag.DefValue)
-	}
-}
 
 func TestBareCommandRejectsUnexpectedArguments(t *testing.T) {
 	if err := rootCmd.Args(rootCmd, []string{"typo"}); err == nil {
@@ -38,12 +24,12 @@ func TestPrepareServiceRunUsesDynamicPortAndWorktreeHostname(t *testing.T) {
 	plan := projectplan.Plan{
 		Project: projectplan.Project{Name: "demo", Worktree: "fix-auth"},
 		Services: []projectplan.Service{{
-			Name: "web", Root: ".", Script: "dev", Profile: models.ProfileHMR,
-			State: projectplan.StateManaged, Hostname: "fix-auth.demo.localhost", URL: "https://fix-auth.demo.localhost:8443",
+			Name: "web", Root: ".", Script: "dev", State: projectplan.StateManaged, Default: true,
+			Listeners: []projectplan.Listener{{Name: "http", Profile: models.ProfileHMR, Public: true, Hostname: "fix-auth.demo.localhost", URL: "https://fix-auth.demo.localhost:8443", Environment: []string{"VITE_PORT"}}},
 		}},
 	}
 
-	run, err := prepareServiceRun(repo, plan, plan.Services[0], map[string]int{"web": 4312}, 1234)
+	run, err := prepareServiceRun(repo, plan, plan.Services[0], endpointPorts(map[string]int{"web": 4312}), 1234)
 	if err != nil {
 		t.Fatalf("prepare service run: %v", err)
 	}
@@ -51,7 +37,7 @@ func TestPrepareServiceRunUsesDynamicPortAndWorktreeHostname(t *testing.T) {
 	if !reflect.DeepEqual(run.Command, wantCommand) {
 		t.Fatalf("expected command %#v, got %#v", wantCommand, run.Command)
 	}
-	if run.Lease.Hostname != "fix-auth.demo.localhost" || run.URL != "https://fix-auth.demo.localhost:8443/" {
+	if len(run.Leases) != 1 || run.Leases[0].Hostname != "fix-auth.demo.localhost" || run.URL != "https://fix-auth.demo.localhost:8443/" {
 		t.Fatalf("unexpected runtime route: %#v", run)
 	}
 	if !containsEnv(run.Env, "LNS_WEB_URL=https://fix-auth.demo.localhost:8443") || !containsEnv(run.Env, "VITE_LNS_WEB_URL=https://fix-auth.demo.localhost:8443") {
@@ -67,12 +53,12 @@ func TestPrepareServiceRunReceivesEveryManagedServicePort(t *testing.T) {
 	plan := projectplan.Plan{
 		Project: projectplan.Project{Name: "peyra"},
 		Services: []projectplan.Service{
-			{Name: "server", Root: ".", Script: "server", Profile: models.ProfileStandard, State: projectplan.StateManaged, Hostname: "peyra-server.localhost", URL: "http://peyra-server.localhost"},
-			{Name: "web", Root: ".", Script: "dev", Profile: models.ProfileHMR, State: projectplan.StateManaged, Hostname: "peyra-web.localhost", URL: "http://peyra-web.localhost"},
+			{Name: "server", Root: ".", Script: "server", State: projectplan.StateManaged, Default: true, Listeners: []projectplan.Listener{{Name: "http", Profile: models.ProfileStandard, Public: true, Hostname: "peyra-server.localhost", URL: "http://peyra-server.localhost", Environment: []string{"PORT"}}}},
+			{Name: "web", Root: ".", Script: "dev", State: projectplan.StateManaged, Default: true, Listeners: []projectplan.Listener{{Name: "http", Profile: models.ProfileHMR, Public: true, Hostname: "peyra-web.localhost", URL: "http://peyra-web.localhost", Environment: []string{"VITE_PORT"}}}},
 		},
 	}
 
-	run, err := prepareServiceRun(repo, plan, plan.Services[1], map[string]int{"server": 4301, "web": 4302}, 1234)
+	run, err := prepareServiceRun(repo, plan, plan.Services[1], endpointPorts(map[string]int{"server": 4301, "web": 4302}), 1234)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,14 +80,14 @@ func TestBuildRunPlanDoesNotCreateRepositoryConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	plan, err := buildRunPlan(repo, config.Settings{HTTPPort: 80, HTTPS: false})
+	plan, err := buildRunPlan(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Services) != 1 || plan.Services[0].Name != "demo" {
 		t.Fatalf("unexpected plan: %#v", plan)
 	}
-	if _, err := os.Stat(filepath.Join(repo, projectconfig.Filename)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(repo, "lns.json")); !os.IsNotExist(err) {
 		t.Fatalf("bare planning created repository config: %v", err)
 	}
 }
@@ -120,11 +106,11 @@ func TestPrepareServiceRunMaterializesInferredPeyraLinks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, ".env.example"), []byte("CLIENT_PORT=5173\nSERVER_PORT=3001\nCORS_ORIGIN=http://localhost:5173\nVITE_API_URL=http://localhost:3001\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := buildRunPlan(repo, config.Settings{HTTPPort: 80, HTTPS: false})
+	plan, err := buildRunPlan(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ports := map[string]int{"server": 4301, "web": 4302}
+	ports := endpointPorts(map[string]int{"server": 4301, "web": 4302})
 	var web, server projectplan.Service
 	for _, service := range plan.Services {
 		switch service.Name {
@@ -152,6 +138,49 @@ func TestPrepareServiceRunMaterializesInferredPeyraLinks(t *testing.T) {
 	}
 }
 
+func TestPrepareCompoundWrapperUsesAllPortsAndOnePublicLease(t *testing.T) {
+	repo := t.TempDir()
+	mustWriteRunFixture(t, filepath.Join(repo, "package.json"), `{
+  "name":"vet-studio", "private":true, "workspaces":["dashboard"],
+  "scripts":{"dashboard":"bash scripts/start-sidecar.sh pnpm --filter @vet-studio/dashboard dev"}
+}`)
+	mustWriteRunFixture(t, filepath.Join(repo, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	mustWriteRunFixture(t, filepath.Join(repo, "dashboard", "package.json"), `{
+  "name":"@vet-studio/dashboard", "scripts":{"dev":"concurrently -k \"tsx watch server.ts\" \"vite\""},
+  "dependencies":{"hono":"^4"}, "devDependencies":{"vite":"^7"}
+}`)
+	mustWriteRunFixture(t, filepath.Join(repo, "dashboard", "vite.config.ts"), `
+const port = Number(process.env.VITE_PORT) || 5173
+const apiTarget = process.env.VITE_API_TARGET || "http://localhost:3377"
+export default {server:{port,proxy:{"/api":{target:apiTarget}}}}
+`)
+	mustWriteRunFixture(t, filepath.Join(repo, "dashboard", "server", "config.ts"), `export const port = parseInt(process.env.PORT ?? "", 10) || 3377`)
+	mustWriteRunFixture(t, filepath.Join(repo, "scripts", "start-sidecar.sh"), `PORT="${SCRIBE_SILERO_SIDECAR_PORT:-8765}"; exec "$@"`)
+
+	plan, err := projectplan.Build(repo, projectplan.Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := plan.Services[0]
+	ports := map[string]int{
+		projectplan.EndpointKey(projectplan.EndpointRef{Service: service.Name, Listener: "http"}):           4401,
+		projectplan.EndpointKey(projectplan.EndpointRef{Service: service.Name, Listener: "api"}):            4402,
+		projectplan.EndpointKey(projectplan.EndpointRef{Service: service.Name, Listener: "silero-sidecar"}): 4403,
+	}
+	run, err := prepareServiceRun(repo, plan, service, ports, 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(run.Command, []string{"pnpm", "run", "dashboard"}) || len(run.Leases) != 1 || run.Leases[0].Port != 4401 {
+		t.Fatalf("unexpected compound run: %#v", run)
+	}
+	for _, expected := range []string{"VITE_PORT=4401", "PORT=4402", "SCRIBE_SILERO_SIDECAR_PORT=4403", "VITE_API_TARGET=http://127.0.0.1:4402"} {
+		if !containsEnv(run.Env, expected) {
+			t.Fatalf("missing %q in compound environment", expected)
+		}
+	}
+}
+
 func containsEnv(env []string, want string) bool {
 	for _, value := range env {
 		if value == want {
@@ -161,61 +190,20 @@ func containsEnv(env []string, want string) bool {
 	return false
 }
 
-func TestSyncProjectWritesRegistryAndCaddyState(t *testing.T) {
-	home := t.TempDir()
-	repo := t.TempDir()
-	t.Setenv("HOME", home)
-
-	cfg := &projectconfig.Config{
-		Name: "demo",
-		Services: map[string]projectconfig.Service{
-			"frontend": {
-				Root:    ".",
-				Port:    3988,
-				Profile: models.ProfileHMR,
-				Status:  models.StatusResolved,
-			},
-		},
+func endpointPorts(values map[string]int) map[string]int {
+	result := make(map[string]int, len(values))
+	for service, port := range values {
+		result[projectplan.EndpointKey(projectplan.EndpointRef{Service: service, Listener: "http"})] = port
 	}
-
-	if err := syncProject(repo, cfg); err != nil {
-		t.Fatalf("syncProject: %v", err)
-	}
-
-	if _, err := os.Stat(config.GetRegistryPath()); err != nil {
-		t.Fatalf("expected registry file: %v", err)
-	}
-	if _, err := os.Stat(config.GetGlobalCaddyfilePath()); err != nil {
-		t.Fatalf("expected global caddyfile: %v", err)
-	}
-	if _, err := os.Stat(caddy.ProjectCaddyfilePath("demo")); err != nil {
-		t.Fatalf("expected project caddyfile: %v", err)
-	}
+	return result
 }
 
-func TestSyncProjectBlocksUnresolvedServicesWithoutMutatingState(t *testing.T) {
-	home := t.TempDir()
-	repo := t.TempDir()
-	t.Setenv("HOME", home)
-
-	cfg := &projectconfig.Config{
-		Name: "demo",
-		Services: map[string]projectconfig.Service{
-			"frontend": {
-				Root:   ".",
-				Status: models.StatusUnresolved,
-			},
-		},
+func mustWriteRunFixture(t *testing.T, path, value string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := syncProject(repo, cfg); err == nil {
-		t.Fatal("expected unresolved sync to fail")
-	}
-
-	if _, err := os.Stat(config.GetRegistryPath()); !os.IsNotExist(err) {
-		t.Fatalf("expected no registry mutation, got %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(config.GetCaddyConfigDir(), "demo.caddy")); !os.IsNotExist(err) {
-		t.Fatalf("expected no project caddyfile, got %v", err)
+	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+		t.Fatal(err)
 	}
 }

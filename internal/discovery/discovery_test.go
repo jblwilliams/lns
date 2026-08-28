@@ -6,72 +6,7 @@ import (
 	"testing"
 
 	"lns/internal/models"
-	"lns/internal/projectconfig"
 )
-
-func TestBootstrapConfigDetectsResolvedWebAtRepoRoot(t *testing.T) {
-	root := t.TempDir()
-	mustWriteFile(t, filepath.Join(root, "package.json"), `{
-  "name": "demo",
-  "scripts": {
-    "dev": "vite --port 5179"
-  },
-  "devDependencies": {
-    "vite": "^6.0.0"
-  }
-}`)
-
-	cfg := BootstrapConfig("demo", root, "")
-
-	service, exists := cfg.Services["demo"]
-	if !exists {
-		t.Fatalf("expected demo service, got %#v", cfg.Services)
-	}
-	if service.Root != "." {
-		t.Fatalf("expected root '.', got %q", service.Root)
-	}
-	if service.Port != 5179 {
-		t.Fatalf("expected port 5179, got %d", service.Port)
-	}
-	if service.Profile != models.ProfileHMR {
-		t.Fatalf("expected hmr profile, got %q", service.Profile)
-	}
-	if service.Status != models.StatusResolved {
-		t.Fatalf("expected resolved status, got %q", service.Status)
-	}
-	if service.Source != models.SourceDetected {
-		t.Fatalf("expected detected source, got %q", service.Source)
-	}
-}
-
-func TestBootstrapConfigMakesPackageDevScriptRunnableWithoutFixedPort(t *testing.T) {
-	root := t.TempDir()
-	mustWriteFile(t, filepath.Join(root, "package.json"), `{
-  "name": "demo",
-  "scripts": {
-    "dev": "next dev"
-  },
-  "dependencies": {
-    "next": "15.0.0"
-  }
-}`)
-
-	cfg := BootstrapConfig("demo", root, "")
-
-	service := cfg.Services["demo"]
-	if service.Port != 0 {
-		t.Fatalf("expected no inferred port, got %d", service.Port)
-	}
-	if service.Profile != models.ProfileHMR {
-		t.Fatalf("expected hmr profile, got %q", service.Profile)
-	}
-	if service.Script != "dev" {
-		t.Fatalf("expected detected dev script, got %q", service.Script)
-	}
-	if service.Status != models.StatusResolved {
-		t.Fatalf("expected runnable service to be resolved, got %q", service.Status)
-	}
-}
 
 func TestDetectServicesFindsAppsFolderService(t *testing.T) {
 	root := t.TempDir()
@@ -176,36 +111,6 @@ func TestDetectServicesPreservesCommonDirectoryNames(t *testing.T) {
 	}
 	if services[1].Name != "server" {
 		t.Fatalf("expected second service name server, got %q", services[1].Name)
-	}
-}
-
-func TestDetectDriftReportsPortAndProfileMismatch(t *testing.T) {
-	root := t.TempDir()
-	mustWriteFile(t, filepath.Join(root, "package.json"), `{
-  "name": "demo",
-  "scripts": {
-    "dev": "vite --port 5179"
-  },
-  "devDependencies": {
-    "vite": "^6.0.0"
-  }
-}`)
-
-	cfg := &projectconfig.Config{
-		Name: "demo",
-		Services: map[string]projectconfig.Service{
-			"demo": {
-				Root:    ".",
-				Port:    3000,
-				Profile: models.ProfileStandard,
-				Status:  models.StatusResolved,
-			},
-		},
-	}
-
-	drifts := DetectDrift(root, cfg)
-	if len(drifts) != 2 {
-		t.Fatalf("expected 2 drifts, got %d: %#v", len(drifts), drifts)
 	}
 }
 

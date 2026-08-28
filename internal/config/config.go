@@ -14,10 +14,6 @@ func GetConfigDir() string {
 	return filepath.Join(homeDir, ".lns")
 }
 
-func GetRegistryPath() string {
-	return filepath.Join(GetConfigDir(), "registry.json")
-}
-
 func GetCaddyConfigDir() string {
 	return filepath.Join(GetConfigDir(), "projects")
 }

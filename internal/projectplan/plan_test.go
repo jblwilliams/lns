@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -32,10 +33,11 @@ func TestBuildDiscoversPlanWithoutWritingRepository(t *testing.T) {
 		t.Fatalf("expected one service, got %#v", plan.Services)
 	}
 	service := plan.Services[0]
-	if service.Name != "momentum" || service.Port.Strategy != PortDynamic {
+	listener := httpListener(t, service)
+	if service.Name != "momentum" || listener.Port.Strategy != PortDynamic || !service.Default {
 		t.Fatalf("unexpected service: %#v", service)
 	}
-	if service.Hostname != "momentum.localhost" || service.URL != "http://momentum.localhost" {
+	if listener.Hostname != "momentum.localhost" || listener.URL != "http://momentum.localhost" {
 		t.Fatalf("unexpected local name: %#v", service)
 	}
 	if after := mustEntries(t, root); !reflect.DeepEqual(after, before) {
@@ -51,7 +53,7 @@ func TestBuildUsesExplicitConfigWithoutRepairingIt(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "lns.json"), `{
   "name": "custom",
   "services": {
-    "web": {"root": ".", "script": "dev", "profile": "hmr", "status": "resolved"}
+    "web": {"root": ".", "script": "dev", "profile": "hmr"}
   }
 }`)
 	mustWrite(t, filepath.Join(root, "package.json"), `{
@@ -121,8 +123,8 @@ func TestBuildUsesRouteSettingsAndCanonicalScopedName(t *testing.T) {
 	if got := ProjectName(root); got != "acme-store" {
 		t.Fatalf("expected canonical scoped name, got %q", got)
 	}
-	if plan.Services[0].URL != "https://acme-store.localhost:8443" {
-		t.Fatalf("unexpected routed URL: %q", plan.Services[0].URL)
+	if got := httpListener(t, plan.Services[0]).URL; got != "https://acme-store.localhost:8443" {
+		t.Fatalf("unexpected routed URL: %q", got)
 	}
 }
 
@@ -136,32 +138,17 @@ func TestProjectNamePrefersComposeIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildSurfacesUnresolvedAndExternalServicesHonestly(t *testing.T) {
+func TestBuildRejectsLegacyDeploymentFieldsInOptionalConfig(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "lns.json"), `{
   "name": "demo",
   "services": {
-    "broken": {"root": ".", "script": "dev", "status": "unresolved"},
-    "proxy": {"root": ".", "port": 9000, "profile": "standard", "status": "resolved"}
+    "web": {"root": ".", "script": "dev", "profile": "hmr", "port": 9000}
   }
 }`)
 
-	plan, err := Build(root, Route{Scheme: "http", Port: 80})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if plan.Services[0].Name != "broken" || plan.Services[0].State != StateUnresolved || plan.Services[0].Port.Strategy != PortUnresolved {
-		t.Fatalf("unexpected unresolved service: %#v", plan.Services[0])
-	}
-	if plan.Services[1].Name != "proxy" || plan.Services[1].State != StateExternal || plan.Services[1].Port.Strategy != PortFixed || plan.Services[1].Port.Fixed != 9000 {
-		t.Fatalf("unexpected external service: %#v", plan.Services[1])
-	}
-	if len(plan.Warnings) != 1 || plan.Warnings[0].Code != "unresolved-service" {
-		t.Fatalf("expected one unresolved warning, got %#v", plan.Warnings)
-	}
-	if plan.Warnings[0].Recovery != "edit lns.json and set a valid profile plus script, command, or port" {
-		t.Fatalf("unexpected recovery: %#v", plan.Warnings[0])
+	if _, err := Build(root, Route{Scheme: "http", Port: 80}); err == nil || !strings.Contains(err.Error(), "unknown field \"port\"") {
+		t.Fatalf("expected strict local-only config error, got %v", err)
 	}
 }
 
@@ -180,7 +167,7 @@ func TestBuildKeepsPortEvidenceAttachedToPortSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	observed := plan.Services[0].Port.Observed
+	observed := httpListener(t, plan.Services[0]).Port.Observed
 	if len(observed) != 1 || observed[0].Value != 4173 || observed[0].Evidence != ".env:VITE_PORT" {
 		t.Fatalf("unexpected observed port provenance: %#v", observed)
 	}
@@ -235,14 +222,19 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/peyra
 
 func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "package.json"), `{"name":"momentum","private":true,"workspaces":["web","server-ts","desktop"]}`)
+	mustWrite(t, filepath.Join(root, "package.json"), `{"name":"momentum","private":true,"workspaces":["web","server-ts","desktop","reader-mode"]}`)
 	mustWrite(t, filepath.Join(root, "web", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
 	mustWrite(t, filepath.Join(root, "server-ts", "package.json"), `{"scripts":{"dev":"tsx watch src/index.ts"},"dependencies":{"hono":"^4"}}`)
 	mustWrite(t, filepath.Join(root, "desktop", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
+	mustWrite(t, filepath.Join(root, "reader-mode", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
+	mustWrite(t, filepath.Join(root, "reader-mode", "vite.config.js"), `const target = process.env.API_PROXY_TARGET || "http://localhost:8787"`)
 	mustWrite(t, filepath.Join(root, "docker-compose.yml"), `services:
   momentum_web:
     environment:
       VITE_MOMENTUM_API_BASE: http://momentum-api.localhost
+  momentum_reader_mode:
+    environment:
+      API_PROXY_TARGET: http://momentum-api.localhost
 `)
 
 	plan, err := Build(root, Route{Scheme: "http", Port: 80})
@@ -253,7 +245,67 @@ func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {
 		t.Fatalf("unexpected project identity: %#v", plan.Project)
 	}
 	web := serviceNamed(t, plan, "web")
+	server := serviceNamed(t, plan, "server-ts")
+	desktop := serviceNamed(t, plan, "desktop")
+	if !web.Default || !server.Default || desktop.Default {
+		t.Fatalf("unexpected default graph: web=%t server=%t desktop=%t", web.Default, server.Default, desktop.Default)
+	}
+	if got := httpListener(t, server).URL; got != "http://momentum-api.localhost" {
+		t.Fatalf("expected API route alias, got %q", got)
+	}
 	assertBinding(t, web, "VITE_MOMENTUM_API_BASE", BindingURL, "server-ts")
+	assertNoBinding(t, web, "API_PROXY_TARGET")
+	reader := serviceNamed(t, plan, "reader-mode")
+	assertBinding(t, reader, "API_PROXY_TARGET", BindingURL, "server-ts")
+}
+
+func TestBuildRetainsMeaningfulWrapperAndInfersCompoundListeners(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name":"vet-studio", "private":true, "workspaces":["dashboard"],
+  "scripts":{
+    "dashboard":"bash scripts/start-with-sidecar.sh pnpm --filter @vet-studio/dashboard dev",
+    "dashboard:dev":"docker compose up -d postgres redis && pnpm --filter @vet-studio/dashboard dev"
+  }
+}`)
+	mustWrite(t, filepath.Join(root, "dashboard", "package.json"), `{
+  "name":"@vet-studio/dashboard",
+  "scripts":{"dev":"concurrently -k \"tsx watch server.ts\" \"vite\""},
+  "dependencies":{"hono":"^4"}, "devDependencies":{"vite":"^7"}
+}`)
+	mustWrite(t, filepath.Join(root, "dashboard", "vite.config.ts"), `
+const port = Number(process.env.VITE_PORT) || 5173
+const target = process.env.VITE_API_TARGET || "http://localhost:3377"
+export default {server:{port,proxy:{"/api":{target}}}}
+`)
+	mustWrite(t, filepath.Join(root, "dashboard", "server", "config.ts"), `export const port = Number(process.env.PORT) || 3377`)
+	mustWrite(t, filepath.Join(root, "scripts", "start-with-sidecar.sh"), `PORT="${SCRIBE_SILERO_SIDECAR_PORT:-8765}"; exec "$@"`)
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := serviceNamed(t, plan, "dashboard")
+	if !service.Default || service.Root != "dashboard" || service.RunRoot != "." || service.Script != "dashboard" {
+		t.Fatalf("unexpected dashboard wrapper: %#v", service)
+	}
+	if len(service.Listeners) != 3 {
+		t.Fatalf("expected web, api, and sidecar listeners, got %#v", service.Listeners)
+	}
+	public := httpListener(t, service)
+	if public.URL != "http://vet-studio.localhost" || !reflect.DeepEqual(public.Environment, []string{"VITE_PORT"}) {
+		t.Fatalf("unexpected public listener: %#v", public)
+	}
+	api, ok := listenerByName(service, "api")
+	if !ok || api.Public || !reflect.DeepEqual(api.Environment, []string{"PORT"}) {
+		t.Fatalf("unexpected API listener: %#v", api)
+	}
+	for _, binding := range service.Environment {
+		if binding.Name == "VITE_API_TARGET" && binding.Target == (EndpointRef{Service: "dashboard", Listener: "api"}) && binding.Network == NetworkLoopback {
+			return
+		}
+	}
+	t.Fatalf("missing private API target: %#v", service.Environment)
 }
 
 func serviceNamed(t *testing.T, plan Plan, name string) Service {
@@ -269,19 +321,40 @@ func serviceNamed(t *testing.T, plan Plan, name string) Service {
 
 func assertObservedPort(t *testing.T, service Service, want int) {
 	t.Helper()
-	if len(service.Port.Observed) != 1 || service.Port.Observed[0].Value != want {
-		t.Fatalf("expected %s observed port %d, got %#v", service.Name, want, service.Port.Observed)
+	observed := httpListener(t, service).Port.Observed
+	if len(observed) != 1 || observed[0].Value != want {
+		t.Fatalf("expected %s observed port %d, got %#v", service.Name, want, observed)
 	}
 }
 
 func assertBinding(t *testing.T, service Service, name string, kind BindingKind, target string) {
 	t.Helper()
 	for _, binding := range service.Environment {
-		if binding.Name == name && binding.Kind == kind && binding.Target == target {
+		if binding.Name == name && binding.Kind == kind && binding.Target.Service == target {
 			return
 		}
 	}
 	t.Fatalf("expected %s binding %s -> %s, got %#v", service.Name, name, target, service.Environment)
+}
+
+func assertNoBinding(t *testing.T, service Service, name string) {
+	t.Helper()
+	for _, binding := range service.Environment {
+		if binding.Name == name {
+			t.Fatalf("unexpected %s binding %s: %#v", service.Name, name, service.Environment)
+		}
+	}
+}
+
+func httpListener(t *testing.T, service Service) Listener {
+	t.Helper()
+	for _, listener := range service.Listeners {
+		if listener.Name == "http" {
+			return listener
+		}
+	}
+	t.Fatalf("service %q has no http listener: %#v", service.Name, service.Listeners)
+	return Listener{}
 }
 
 func mustWrite(t *testing.T, path, contents string) {

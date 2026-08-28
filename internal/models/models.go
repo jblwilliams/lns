@@ -1,27 +1,10 @@
 package models
 
-import "strconv"
-
 type Profile string
 
 const (
 	ProfileHMR      Profile = "hmr"
 	ProfileStandard Profile = "standard"
-)
-
-func ValidProfiles() []string {
-	return []string{
-		string(ProfileHMR),
-		string(ProfileStandard),
-	}
-}
-
-type ServiceSource string
-
-const (
-	SourceConfig   ServiceSource = "config"
-	SourceManual   ServiceSource = "manual"
-	SourceDetected ServiceSource = "detected"
 )
 
 type ServiceStatus string
@@ -32,18 +15,14 @@ const (
 )
 
 type Service struct {
-	Name          string        `json:"name"`
-	Root          string        `json:"root,omitempty"`
-	Port          int           `json:"port,omitempty"`
-	ContainerPort int           `json:"container_port,omitempty"`
-	Script        string        `json:"script,omitempty"`
-	Command       []string      `json:"command,omitempty"`
-	Profile       Profile       `json:"profile,omitempty"`
-	Hostname      string        `json:"hostname,omitempty"`
-	Source        ServiceSource `json:"source,omitempty"`
-	Status        ServiceStatus `json:"status,omitempty"`
-	Docker        bool          `json:"docker,omitempty"`
-	ContainerName string        `json:"container_name,omitempty"`
+	Name     string        `json:"name"`
+	Root     string        `json:"root,omitempty"`
+	Port     int           `json:"port,omitempty"`
+	Script   string        `json:"script,omitempty"`
+	Command  []string      `json:"command,omitempty"`
+	Profile  Profile       `json:"profile,omitempty"`
+	Hostname string        `json:"hostname,omitempty"`
+	Status   ServiceStatus `json:"status,omitempty"`
 }
 
 func (s Service) EffectiveProfile() Profile {
@@ -53,18 +32,11 @@ func (s Service) EffectiveProfile() Profile {
 	return s.Profile
 }
 
-func (s Service) EffectiveSource() ServiceSource {
-	if s.Source == "" {
-		return SourceConfig
-	}
-	return s.Source
-}
-
 func (s Service) EffectiveStatus() ServiceStatus {
 	if s.Status != "" {
 		return s.Status
 	}
-	if s.Root != "" && (s.Port > 0 || s.CanRun()) && s.Profile != "" {
+	if s.Root != "" && s.CanRun() && s.Profile != "" {
 		return StatusResolved
 	}
 	return StatusUnresolved
@@ -74,42 +46,14 @@ func (s Service) IsResolved() bool {
 	return s.EffectiveStatus() == StatusResolved
 }
 
-func (s *Service) GetHostname(projectPrefix string) string {
-	if s.Hostname != "" {
-		return s.Hostname
-	}
-	return projectPrefix + "-" + s.Name + ".localhost"
-}
-
-func (s *Service) GetUpstream() string {
-	return "localhost:" + strconv.Itoa(s.Port)
-}
-
-func (s *Service) GetDockerUpstream() string {
-	port := s.DeploymentPort()
-	if s.Docker && s.ContainerName != "" {
-		return s.ContainerName + ":" + strconv.Itoa(port)
-	}
-	return "localhost:" + strconv.Itoa(port)
-}
-
-func (s Service) DeploymentPort() int {
-	if s.ContainerPort > 0 {
-		return s.ContainerPort
-	}
-	return s.Port
-}
-
 func (s Service) CanRun() bool {
 	return s.Script != "" || len(s.Command) > 0
 }
 
 type Project struct {
-	Name          string    `json:"name"`
-	Prefix        string    `json:"prefix,omitempty"`
-	Path          string    `json:"path,omitempty"`
-	Services      []Service `json:"services"`
-	DockerNetwork string    `json:"docker_network,omitempty"`
+	Name     string    `json:"name"`
+	Prefix   string    `json:"prefix,omitempty"`
+	Services []Service `json:"services"`
 }
 
 func (p *Project) GetPrefix() string {
@@ -123,27 +67,8 @@ func (p *Project) GetServiceHostname(service Service) string {
 	if service.Hostname != "" {
 		return service.Hostname
 	}
-
-	prefix := p.GetPrefix()
 	if len(p.Services) == 1 {
-		return prefix + ".localhost"
+		return p.GetPrefix() + ".localhost"
 	}
-
-	return prefix + "-" + service.Name + ".localhost"
-}
-
-type Registry struct {
-	Version             string             `json:"version"`
-	Projects            map[string]Project `json:"projects"`
-	PortAssignments     map[int]string     `json:"port_assignments"`
-	HostnameAssignments map[string]string  `json:"hostname_assignments,omitempty"`
-}
-
-func NewRegistry() *Registry {
-	return &Registry{
-		Version:             "2.0",
-		Projects:            make(map[string]Project),
-		PortAssignments:     make(map[int]string),
-		HostnameAssignments: make(map[string]string),
-	}
+	return p.GetPrefix() + "-" + service.Name + ".localhost"
 }

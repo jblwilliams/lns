@@ -10,14 +10,11 @@ import (
 
 const (
 	DefaultHTTPPort  = 80
-	FallbackHTTPPort = 8888
 	DefaultAdminAddr = "127.0.0.1:20190"
 )
 
 type Settings struct {
-	HTTPPort  int    `json:"http_port"`
 	AdminAddr string `json:"admin_addr"`
-	HTTPS     bool   `json:"https"`
 }
 
 func GetSettingsPath() string {
@@ -26,9 +23,7 @@ func GetSettingsPath() string {
 
 func DefaultSettings() Settings {
 	return Settings{
-		HTTPPort:  DefaultHTTPPort,
 		AdminAddr: DefaultAdminAddr,
-		HTTPS:     false,
 	}
 }
 
@@ -68,10 +63,6 @@ func SaveSettings(settings Settings) error {
 }
 
 func (s *Settings) applyDefaultsAndValidate() {
-	if s.HTTPPort < 1 || s.HTTPPort > 65535 {
-		s.HTTPPort = DefaultHTTPPort
-	}
-
 	if s.AdminAddr == "" {
 		s.AdminAddr = DefaultAdminAddr
 	}

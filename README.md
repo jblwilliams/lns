@@ -1,205 +1,138 @@
 # lns
 
-`lns` gives local HTTP services stable HTTPS names without making you coordinate development ports.
-
-Run `lns` in a repo. It discovers runnable services, leases free ports, starts or reloads Caddy, and runs the services at names such as `https://my-app.localhost`. The checked-in `lns.json` keeps names and deployment metadata stable; process-owned runtime leases keep local ports disposable.
-
-## Installation
-
-```bash
-go install ./cmd/lns
-brew install caddy # macOS
-```
-
-On Ubuntu or Debian, install Caddy with `sudo apt install caddy`.
-
-## Quick Start
+`lns` gives local development services stable names while leaving their ports disposable.
 
 ```bash
 cd ~/projects/my-app
 lns
 ```
 
-The first run creates `lns.json` when needed. Bare `lns` runs every detected service with a runnable script or command.
+There is no required project configuration and no repository write on first run. LNS inspects existing development scripts, workspaces, environment examples, and the canonical local Compose file in memory. Developers who do not run LNS are unaffected.
 
-Run one service or override its command for one invocation:
-
-```bash
-lns run web
-lns run api -- pnpm run server
-```
-
-Services use stable public names:
+Typical routes are plain HTTP names with no visible port:
 
 ```text
-single-service repo:  https://<project>.localhost
-multi-service repo:   https://<project>-<service>.localhost
+http://my-app.localhost
+http://my-app-web.localhost
+http://my-app-api.localhost
 ```
 
-Local HTTPS uses Caddy's internal CA. The proxy defaults to port `443`; `8443` is the unprivileged fallback. Run `lns setup` to change it or `lns start --no-tls` when plain HTTP is specifically required.
-
-## Configuration
-
-`lns.json` is the checked-in description of a repo. Development and deployment ports are deliberately separate:
-
-```json
-{
-  "name": "my-app",
-  "services": {
-    "web": {
-      "root": "web",
-      "script": "dev",
-      "container_port": 5173,
-      "profile": "hmr",
-      "status": "resolved"
-    },
-    "api": {
-      "root": "api",
-      "command": ["uv", "run", "uvicorn", "app:app", "--port", "{port}"],
-      "container_port": 8000,
-      "profile": "standard",
-      "docker": true,
-      "container_name": "api",
-      "status": "resolved"
-    }
-  }
-}
-```
-
-Required top-level fields:
-
-- `name`
-- `services`
-
-A resolved service needs `root`, `profile`, and one way to run or route:
-
-- `script`: a `package.json` script such as `dev`
-- `command`: an argument array; `{port}` becomes the leased development port
-- `port`: a fixed legacy/static host port
-
-Optional deployment fields:
-
-- `container_port`: stable internal port used by Docker exports
-- `docker`
-- `container_name`
-- `hostname`
-
-`hmr` is appropriate for browser dev servers. `standard` is appropriate for APIs and other normal HTTP servers.
-
-For manual setup:
+## Install
 
 ```bash
-lns init
-lns service add api api --script dev --container-port 8000 --profile standard
-lns sync
+go install ./cmd/lns
+brew install caddy # macOS
 ```
 
-## Runtime Behavior
+On Linux, install Caddy and allow it to bind port 80. For example:
 
-`lns` chooses a free loopback port for each child process, registers a process-owned route, and removes it when the process exits. Dead owners are pruned after crashes.
+```bash
+sudo setcap 'cap_net_bind_service=+ep' "$(command -v caddy)"
+```
 
-Each child receives:
+On macOS or Linux without that capability, the first interactive proxy start asks for `sudo` and leaves Caddy running in the background. Non-interactive runs fail with an actionable message instead of hanging on a password prompt.
 
-- `LNS_PORT`: its leased development port
-- `PORT` and `<SERVICE>_PORT` for normal HTTP servers
-- `VITE_PORT` for scripts that start Vite
-- `HOST=127.0.0.1`
-- `LNS_URL`: its public local URL
-- `LNS_<SERVICE>_URL`: the URL of every service in the project
-- `VITE_LNS_<SERVICE>_URL`: the same values exposed to Vite clients
+Run `lns doctor` to check the local setup.
 
-For example, a `web` service in a project with an `api` service receives `LNS_API_URL` and `VITE_LNS_API_URL`.
+## What bare `lns` does
 
-Simple Vite, Next.js, and Nuxt scripts receive explicit loopback host and leased-port arguments, replacing fixed development flags when present. Compound scripts such as a dashboard that starts both an API and Vite receive `VITE_PORT`, leaving the API's private port alone. A service named `server` receives `SERVER_PORT`, which matches projects such as Peyra. Use `command` with `{port}` when a server needs a different custom argument or variable.
+Bare `lns`:
+
+1. Build the same read-only plan shown by `lns plan`.
+2. Select the main browser app and the backend it links to, rather than launching every workspace package.
+3. Reuse or start required Postgres, Redis, and validated private worker services from the repository's normal local Compose project.
+4. Allocate every application listener before starting any child process.
+5. Start or reload Caddy and route the stable local names to those listeners.
+6. Clean up processes and routes, then stop only the Compose services that this run started.
+
+Inventory services that are not part of the default app remain available explicitly:
+
+```bash
+lns run marketing-site
+lns run api -- pnpm run custom-api
+```
+
+If LNS cannot identify one safe default, it starts nothing and `lns plan` explains how to choose a service.
+
+## Dynamic ports
+
+Each child receives the variables its existing development setup already uses, plus LNS's generic variables:
+
+- `LNS_PORT`, `LNS_URL`, and `HOST=127.0.0.1`
+- `PORT` for normal servers
+- `VITE_PORT` for Vite
+- inferred variables such as `SERVER_PORT`, `CLIENT_PORT`, `VITE_API_URL`, and `CORS_ORIGIN`
+- `LNS_<SERVICE>_URL` and `VITE_LNS_<SERVICE>_URL` for every discovered public service
+
+Compound scripts are one lifecycle with multiple listeners. For example, a `concurrently` script that starts an API and Vite receives different dynamic `PORT` and `VITE_PORT` values, while Vite's local proxy target points to the private API listener. Auxiliary ports explicitly exposed by a retained root wrapper are dynamic too.
+
+All listener allocations happen before the first development command is prepared, so cross-service links use the final values.
+
+## Docker dependencies
+
+LNS reads only the canonical local file (`compose.yml`, `compose.yaml`, `docker-compose.yml`, or `docker-compose.yaml`). It does not inspect or alter staging and production variants.
+
+For recognized Postgres and Redis dependencies, LNS:
+
+- asks Docker for loopback-only ephemeral host ports;
+- keeps container ports such as `5432` and `6379` unchanged;
+- writes its temporary Compose override under `~/.lns/dependencies`, never in the repository;
+- reuses already-running local dependencies when they expose a usable host port;
+- starts only the validated dependency closure and required private workers, never the selected foreground application;
+- rewrites only local database/Redis connection values in child-process memory;
+- preserves credentials, paths, queries, and the normal project's named development volumes;
+- stops only services it started and never deletes their containers or volumes.
+
+External database hosts, TLS Redis URLs, test database URLs, host networking, published worker ports, global Compose resources, and unsafe dependency graphs are not silently rewritten or started.
+
+LNS deliberately does not invent a project-specific database bootstrap. Existing development volumes continue to work. A fresh database still needs the repository's normal migrations, role provisioning, tenant choices, or seed commands.
+
+## Opt-in by design
+
+LNS does not require a checked-in file, install a package hook, replace a project's normal scripts, or change Docker metadata. A developer can try it in an existing checkout and stop using it without leaving repository changes behind.
+
+An `lns.json` file is still accepted as an explicit override for unusual repositories, but it is not the normal setup path.
 
 ## Worktrees
 
-Linked Git worktrees automatically receive a branch subdomain:
+Linked Git worktrees get an additional branch label and independent process ports:
 
 ```text
-main checkout:       https://my-app.localhost
-fix-auth worktree:   https://fix-auth.my-app.localhost
+main checkout:       http://my-app.localhost
+fix-auth worktree:   http://fix-auth.my-app.localhost
 ```
 
-Every worktree receives independent runtime ports. The branch prefix and leased ports never modify `lns.json` or Docker metadata.
-
-## Workspaces and Detection
-
-`lns init` and first-run bootstrapping inspect:
-
-- `package.json` and `pnpm-workspace.yaml` workspaces
-- `dev` plus common sibling `server`/`api` scripts
-- Vite, Next.js, Nuxt, Vue, Hono, Express, Fastify, and Koa signals
-- `pyproject.toml`, `requirements.txt`, and common Python server files
-- `Gemfile`
-- `.env*` and common framework configuration files
-
-Packages with a `dev` script become runnable services when an HTTP profile can be identified. Ambiguous services remain unresolved until you add a profile, script, command, or fixed port.
-
-## Commands
+## Useful commands
 
 ```bash
-lns                              # bootstrap and run all services
-lns up                           # run all configured services
-lns run [service]                # run one service
-lns run [service] -- <command>   # one-time command override
-lns sync                         # validate and compile; auto-reload if running
-lns status                       # repo-local status
-lns status --global              # global registry
-lns start                        # start Caddy only
-lns stop                         # stop Caddy
-lns reload                       # manually reload Caddy
-lns doctor                       # diagnose local setup
-lns config                       # show state paths and proxy settings
+lns                         # plan and run the default local app graph
+lns plan                    # explain the plan without changing state
+lns plan --json             # machine-readable plan only
+lns run <service>           # explicitly run one inventory service
+lns run <service> -- <cmd>  # one-run command override
+lns doctor                  # check Caddy, state, and setup
+lns config                  # show global state paths
+lns stop                    # stop the shared Caddy proxy
 ```
 
-Use `lns run <service> --port <port>` when you intentionally need a fixed development port for one run.
+`lns run <service> --port <port>` is available when a fixed application port is intentionally required for one run.
 
-## Sync and State
+## Global state
 
-`lns sync` validates `lns.json`, rejects unresolved services and hostname conflicts, updates the global registry, and regenerates Caddyfiles. Fixed host ports still receive conflict checks; dynamically run services do not reserve port zero.
+LNS keeps machine-local state under `~/.lns`:
 
-If Caddy is already running, sync reloads it automatically. Invalid changes do not silently pick a different checked-in port or mutate deployment metadata.
+- `runtime.json`: process-owned routes
+- `Caddyfile` and `projects/00-runtime.caddy`: generated process-owned proxy configuration
+- `dependencies/`: short-lived Compose overrides and ownership records
+- `settings.json`: the Caddy admin address
 
-Global state lives under `~/.lns`:
-
-- `registry.json`: compiled repo definitions
-- `runtime.json`: active process leases
-- `Caddyfile`: global generated configuration
-- `projects/*.caddy`: project and runtime routes
-- `settings.json`: HTTPS, proxy port, and Caddy admin settings
-
-Registry and runtime mutations use a shared lock and atomic file replacement so concurrent worktrees do not overwrite one another.
-
-## Docker and Deployment Ports
-
-Development leases do not change Docker behavior. `lns run` uses a dynamic host port, while Docker exports use `container_port`, falling back to legacy `port` for older manifests.
-
-```bash
-lns export my-app -o Caddyfile --upstream docker
-lns export my-app --docker-compose
-```
-
-Exports listen on port `80` by default, independent of the local HTTPS proxy setting. Use `--proxy-port` to choose a different deployment listener port.
-
-This lets a Vite service use any free local port while its container continues to listen on `5173`, and lets an API lease any local port while staging and production continue to use container port `8000`.
-
-`lns` does not rewrite Compose files or dynamically change Postgres, Redis, or other non-HTTP backing-service ports. Keep those in Compose or environment-specific infrastructure configuration.
-
-## Troubleshooting
-
-If a service is unresolved, open `lns.json` and add a `script`, `command`, `port`, or missing `profile`, then run `lns` again.
-
-If port `443` cannot be bound without extra setup, run `lns setup` and select `8443`. Check the whole setup with:
-
-```bash
-lns doctor
-```
+The public route contract is always `http://*.localhost` on port 80. Legacy HTTPS or proxy-port values in an older settings file do not change a bare run.
 
 ## Development
 
 ```bash
-env GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./...
+env GOCACHE=/tmp/lns-go-build-cache go test ./...
+env GOCACHE=/tmp/lns-go-build-cache go vet ./...
 ```
 
 ## License
