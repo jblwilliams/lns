@@ -14,19 +14,21 @@ import (
 )
 
 func RegenerateAllCaddyfiles() ([]string, error) {
-	leases, err := devruntime.NewStore().Load()
-	if err != nil {
-		return nil, err
-	}
-	runtimePath, err := WriteRuntimeCaddyfile(leases)
-	if err != nil {
-		return nil, err
-	}
-	globalPath, err := WriteGlobalCaddyfile()
-	if err != nil {
-		return []string{runtimePath}, err
-	}
-	return []string{runtimePath, globalPath}, nil
+	var paths []string
+	err := devruntime.NewStore().WithLeases(func(leases []devruntime.Lease) error {
+		runtimePath, err := WriteRuntimeCaddyfile(leases)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, runtimePath)
+		globalPath, err := WriteGlobalCaddyfile()
+		if err != nil {
+			return err
+		}
+		paths = append(paths, globalPath)
+		return nil
+	})
+	return paths, err
 }
 
 func GenerateRuntimeCaddyfile(leases []devruntime.Lease, proxyPort int, https bool) string {
@@ -38,6 +40,7 @@ func GenerateRuntimeCaddyfile(leases []devruntime.Lease, proxyPort int, https bo
 			scheme = "https"
 		}
 		fmt.Fprintf(&output, "%s://%s:%d {\n", scheme, lease.Hostname, proxyPort)
+		output.WriteString("\tbind 127.0.0.1 ::1\n")
 		if https {
 			output.WriteString("\ttls internal\n")
 		}
@@ -64,7 +67,7 @@ func WriteRuntimeCaddyfile(leases []devruntime.Lease) (string, error) {
 	return path, nil
 }
 
-func GenerateGlobalCaddyfile(proxyPort int, adminAddr string) string {
+func GenerateGlobalCaddyfile(proxyPort int) string {
 	return fmt.Sprintf(`# LNS shared local proxy
 {
 	admin %s
@@ -73,19 +76,15 @@ func GenerateGlobalCaddyfile(proxyPort int, adminAddr string) string {
 }
 
 import %s
-`, adminAddr, proxyPort, config.GetRuntimeCaddyfilePath())
+`, config.CaddyAdminAddr, proxyPort, config.GetRuntimeCaddyfilePath())
 }
 
 func WriteGlobalCaddyfile() (string, error) {
-	settings, err := config.LoadSettings()
-	if err != nil {
-		return "", err
-	}
 	path := config.GetGlobalCaddyfilePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return "", err
 	}
-	if err := state.WriteFileAtomic(path, []byte(GenerateGlobalCaddyfile(config.DefaultHTTPPort, settings.AdminAddr)), 0644); err != nil {
+	if err := state.WriteFileAtomic(path, []byte(GenerateGlobalCaddyfile(config.DefaultHTTPPort)), 0644); err != nil {
 		return "", err
 	}
 	return path, nil

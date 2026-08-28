@@ -1,17 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-isatty"
 )
 
-func startCaddy(caddyPath, caddyfile string, proxyPort int) error {
+func startCaddy(ctx context.Context, caddyPath, caddyfile string, proxyPort int) error {
 	args := []string{"start", "--config", caddyfile}
-	direct := exec.Command(caddyPath, args...)
+	direct := exec.CommandContext(ctx, caddyPath, args...)
 	output, err := direct.CombinedOutput()
 	if err == nil {
 		if len(output) > 0 {
@@ -32,7 +35,7 @@ func startCaddy(caddyPath, caddyfile string, proxyPort int) error {
 		return fmt.Errorf("proxy port %d needs elevation and sudo is unavailable", proxyPort)
 	}
 	fmt.Printf("Proxy port %d needs one-time elevation for this Caddy process.\n", proxyPort)
-	elevated := exec.Command(sudoPath, append([]string{caddyPath}, args...)...)
+	elevated := exec.CommandContext(ctx, sudoPath, append([]string{caddyPath}, args...)...)
 	elevated.Stdin = os.Stdin
 	elevated.Stdout = os.Stdout
 	elevated.Stderr = os.Stderr
@@ -52,11 +55,11 @@ func firstNonEmpty(values ...string) string {
 }
 
 func isTerminal(f *os.File) bool {
-	info, err := f.Stat()
-	if err != nil {
+	if f == nil {
 		return false
 	}
-	return (info.Mode() & os.ModeCharDevice) != 0
+	fd := f.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 func isTCPListening(addr string) bool {

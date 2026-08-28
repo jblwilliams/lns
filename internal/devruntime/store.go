@@ -34,18 +34,29 @@ func NewStore() *Store {
 
 func (s *Store) Load() ([]Lease, error) {
 	var leases []Lease
-	err := state.WithGlobalLock(func() error {
-		loaded, changed, err := s.loadUnlocked()
-		if err != nil {
-			return err
-		}
+	err := s.WithLeases(func(loaded []Lease) error {
 		leases = loaded
-		if changed {
-			return s.saveUnlocked(loaded)
-		}
 		return nil
 	})
 	return leases, err
+}
+
+// WithLeases holds the shared state lock while fn observes the canonical live
+// lease snapshot. It is used when a derived artifact, such as the Caddy route
+// file, must be written atomically with respect to lease mutations.
+func (s *Store) WithLeases(fn func([]Lease) error) error {
+	return state.WithGlobalLock(func() error {
+		leases, changed, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if changed {
+			if err := s.saveUnlocked(leases); err != nil {
+				return err
+			}
+		}
+		return fn(append([]Lease(nil), leases...))
+	})
 }
 
 func (s *Store) Add(lease Lease) error {

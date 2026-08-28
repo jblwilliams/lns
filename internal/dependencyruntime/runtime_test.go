@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,12 +41,45 @@ func TestSelectProvidersForRepresentativeProjectShapes(t *testing.T) {
 	}
 }
 
+func TestComposeOwnerFollowsComposeProjectAcrossWorktrees(t *testing.T) {
+	if composeOwner("peyra", "/worktrees/main") != composeOwner("peyra", "/worktrees/feature") {
+		t.Fatal("worktrees sharing a named Compose project must share one ownership lock")
+	}
+	if composeOwner("", "/projects/one") == composeOwner("", "/projects/two") {
+		t.Fatal("unnamed Compose projects in different roots must not share a lock")
+	}
+}
+
+func TestClaimOwnerPreservesLiveOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compose-demo.owner.json")
+	mustWriteDependencyFile(t, path, fmt.Sprintf(`{"pid":%d}`, os.Getpid()))
+	if _, err := claimOwner(path); err == nil {
+		t.Fatal("expected live owner conflict")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("live owner record was removed: %v", err)
+	}
+}
+
+func TestClaimOwnerReturnsStaleStartedServices(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compose-demo.owner.json")
+	mustWriteDependencyFile(t, path, `{"pid":99999999,"started":["postgres","worker"],"override":"/tmp/old.yml"}`)
+	stale, err := claimOwner(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(stale.Started, []string{"postgres", "worker"}) || stale.Override != "/tmp/old.yml" {
+		t.Fatalf("stale ownership was lost: %#v", stale)
+	}
+}
+
 func TestStartUsesEphemeralOverrideAndRewritesOnlyLocalConnections(t *testing.T) {
 	root := t.TempDir()
 	state := t.TempDir()
 	mustWriteDependencyFile(t, filepath.Join(root, "docker-compose.yml"), "services:\n  postgres:\n    image: postgres:18\n  redis:\n    image: redis:7\n")
 	mustWriteDependencyFile(t, filepath.Join(root, ".env"), strings.Join([]string{
 		"DATABASE_URL=postgresql://user:secret@localhost:5432/app?sslmode=disable",
+		"APP_DATABASE_URL=postgresql+asyncpg://user:secret@postgres:5432/app",
 		"REDIS_URL=redis://localhost:6379/2",
 	}, "\n"))
 	model := composeModel{Services: map[string]composeService{
@@ -65,8 +99,9 @@ func TestStartUsesEphemeralOverrideAndRewritesOnlyLocalConnections(t *testing.T)
 	overrides := session.Overrides("server")
 	for key, want := range map[string]string{
 		"PGHOST": "127.0.0.1", "PGPORT": "49101", "REDIS_HOST": "127.0.0.1", "REDIS_PORT": "49102",
-		"DATABASE_URL": "postgresql://user:secret@127.0.0.1:49101/app?sslmode=disable",
-		"REDIS_URL":    "redis://127.0.0.1:49102/2",
+		"DATABASE_URL":     "postgresql://user:secret@127.0.0.1:49101/app?sslmode=disable",
+		"APP_DATABASE_URL": "postgresql+asyncpg://user:secret@127.0.0.1:49101/app",
+		"REDIS_URL":        "redis://127.0.0.1:49102/2",
 	} {
 		if overrides[key] != want {
 			t.Fatalf("%s: want %q, got %q", key, want, overrides[key])
@@ -216,6 +251,19 @@ func TestProviderOverridesRespectRemoteSplitConfiguration(t *testing.T) {
 	}
 }
 
+func TestDotenvLocalLayerPreventsRemoteDatabaseOverride(t *testing.T) {
+	root := t.TempDir()
+	mustWriteDependencyFile(t, filepath.Join(root, ".env"), "DATABASE_URL=postgresql://user:secret@localhost:5432/app\n")
+	mustWriteDependencyFile(t, filepath.Join(root, ".env.local"), "DATABASE_URL=postgresql://user:secret@staging.example.com:5432/app\n")
+	services := []projectplan.Service{{Name: "api", Root: "."}}
+	dotenv := dotenvByService(root, services)
+	result := map[string]map[string]string{}
+	applyProviderOverrides(result, root, services, dotenv, provider{Name: "postgres", Kind: "postgres", Port: 49101})
+	if result["api"]["DATABASE_URL"] != "" || result["api"]["PGHOST"] != "" {
+		t.Fatalf("higher-precedence remote dotenv was overridden: %#v", result["api"])
+	}
+}
+
 func TestLocalPostgresUsesVerifiedExampleRoleDefaults(t *testing.T) {
 	root := t.TempDir()
 	mustWriteDependencyFile(t, filepath.Join(root, ".env.example"), strings.Join([]string{
@@ -295,6 +343,31 @@ func TestStartRollsBackPartiallyFailedComposeUp(t *testing.T) {
 	entries, readErr := os.ReadDir(state)
 	if readErr != nil || len(entries) != 0 {
 		t.Fatalf("failed startup leaked state: %v, %#v", readErr, entries)
+	}
+}
+
+func TestClosePreservesOwnershipWhenComposeStopFails(t *testing.T) {
+	state := t.TempDir()
+	owner := filepath.Join(state, "compose-demo.owner.json")
+	override := filepath.Join(state, "demo.override.yml")
+	mustWriteDependencyFile(t, owner, `{"pid":1,"started":["postgres"]}`)
+	mustWriteDependencyFile(t, override, "services: {}\n")
+	runner := &fakeRunner{failOn: "stop"}
+	session := &Session{
+		runner: runner, ownerPath: owner, started: []string{"postgres"},
+		command: composeCommand{root: t.TempDir(), source: "compose.yml", override: override},
+	}
+	if err := session.Close(context.Background()); err == nil {
+		t.Fatal("expected stop failure")
+	}
+	if _, err := os.Stat(owner); err != nil {
+		t.Fatalf("owner record was removed after failed stop: %v", err)
+	}
+	if _, err := os.Stat(override); err != nil {
+		t.Fatalf("override was removed after failed stop: %v", err)
+	}
+	if !reflect.DeepEqual(session.started, []string{"postgres"}) {
+		t.Fatalf("started services were forgotten: %#v", session.started)
 	}
 }
 

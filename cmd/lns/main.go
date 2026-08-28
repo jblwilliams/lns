@@ -57,10 +57,6 @@ var startCmd = &cobra.Command{
 		if err := config.EnsureConfigDirs(); err != nil {
 			return fmt.Errorf("create LNS state directories: %w", err)
 		}
-		settings, err := config.LoadSettings()
-		if err != nil {
-			return fmt.Errorf("load LNS settings: %w", err)
-		}
 		if _, err := caddy.RegenerateAllCaddyfiles(); err != nil {
 			return fmt.Errorf("generate proxy configuration: %w", err)
 		}
@@ -68,11 +64,11 @@ var startCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("Caddy is not installed; install it with `brew install caddy` or from https://caddyserver.com/docs/install")
 		}
-		if isTCPListening(settings.AdminAddr) {
+		if isTCPListening(config.CaddyAdminAddr) {
 			printSuccess("Proxy is already running")
 			return nil
 		}
-		if err := startCaddy(caddyPath, config.GetGlobalCaddyfilePath(), config.DefaultHTTPPort); err != nil {
+		if err := startCaddy(cmd.Context(), caddyPath, config.GetGlobalCaddyfilePath(), config.DefaultHTTPPort); err != nil {
 			return err
 		}
 		printSuccess("Proxy started at http://*.localhost")
@@ -85,19 +81,15 @@ var stopCmd = &cobra.Command{
 	Short: "Stop the shared local proxy",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		settings, err := config.LoadSettings()
-		if err != nil {
-			return fmt.Errorf("load LNS settings: %w", err)
-		}
-		if !isTCPListening(settings.AdminAddr) {
+		if !isTCPListening(config.CaddyAdminAddr) {
 			printSuccess("Proxy is already stopped")
 			return nil
 		}
 		caddyPath, err := exec.LookPath("caddy")
 		if err != nil {
-			return fmt.Errorf("Caddy is not in PATH; stop the process listening at %s manually", settings.AdminAddr)
+			return fmt.Errorf("Caddy is not in PATH; stop the process listening at %s manually", config.CaddyAdminAddr)
 		}
-		command := exec.Command(caddyPath, "stop", "--address", settings.AdminAddr)
+		command := exec.Command(caddyPath, "stop", "--address", config.CaddyAdminAddr)
 		command.Stdout = os.Stdout
 		command.Stderr = os.Stderr
 		if err := command.Run(); err != nil {
@@ -138,10 +130,7 @@ var doctorCmd = &cobra.Command{
 		} else {
 			printSuccess("Docker Compose: %s", strings.TrimSpace(string(output)))
 		}
-		settings, err := config.LoadSettings()
-		if err != nil {
-			issues = append(issues, "settings are invalid: "+err.Error())
-		} else if isTCPListening(settings.AdminAddr) {
+		if isTCPListening(config.CaddyAdminAddr) {
 			printSuccess("Proxy is running")
 		} else {
 			printWarning("Proxy will start on the first `lns` run")

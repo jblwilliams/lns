@@ -5,6 +5,11 @@ import (
 	"path/filepath"
 )
 
+const (
+	DefaultHTTPPort = 80
+	CaddyAdminAddr  = "127.0.0.1:20190"
+)
+
 func GetConfigDir() string {
 	homeDir, _ := os.UserHomeDir()
 	if homeDir == "" {

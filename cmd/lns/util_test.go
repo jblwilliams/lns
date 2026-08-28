@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 func TestStartCaddyUsesDirectExecutableWhenItCanBind(t *testing.T) {
 	executable := writeExecutable(t, "#!/bin/sh\nexit 0\n")
-	if err := startCaddy(executable, filepath.Join(t.TempDir(), "Caddyfile"), config.DefaultHTTPPort); err != nil {
+	if err := startCaddy(context.Background(), executable, filepath.Join(t.TempDir(), "Caddyfile"), config.DefaultHTTPPort); err != nil {
 		t.Fatalf("direct Caddy start failed: %v", err)
 	}
 }
@@ -30,9 +31,20 @@ func TestStartCaddyDoesNotPromptForSudoWithoutTerminal(t *testing.T) {
 		_ = read.Close()
 	})
 
-	err = startCaddy(executable, filepath.Join(t.TempDir(), "Caddyfile"), config.DefaultHTTPPort)
+	err = startCaddy(context.Background(), executable, filepath.Join(t.TempDir(), "Caddyfile"), config.DefaultHTTPPort)
 	if err == nil || !strings.Contains(err.Error(), "run `lns start` once in an interactive terminal") {
 		t.Fatalf("expected non-interactive elevation guidance, got %v", err)
+	}
+}
+
+func TestDevNullIsNotInteractive(t *testing.T) {
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if isTerminal(null) {
+		t.Fatal("a character device such as /dev/null must not trigger a sudo prompt")
 	}
 }
 

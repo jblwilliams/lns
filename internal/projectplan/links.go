@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"lns/internal/devrun"
 	"lns/internal/discovery"
 	"lns/internal/models"
 )
@@ -93,7 +94,7 @@ func readEnvironmentSignals(root string, services []Service) []environmentSignal
 					continue
 				}
 				value := cleanEnvironmentValue(match[2])
-				if isNamedPort(match[1], value) || isLocalHTTPValue(value) {
+				if isNamedPort(match[1], value) || isServiceLinkName(match[1]) {
 					signals = append(signals, environmentSignal{name: match[1], value: value, evidence: filepath.ToSlash(rel), consumer: service.Name})
 				}
 			}
@@ -108,14 +109,50 @@ func readEnvironmentSignals(root string, services []Service) []environmentSignal
 			rel, _ := filepath.Rel(root, path)
 			for _, match := range inlineEnvironmentDefault.FindAllStringSubmatch(string(data), -1) {
 				value := cleanEnvironmentValue(match[2])
-				if isNamedPort(match[1], value) || isLocalHTTPValue(value) {
+				if isNamedPort(match[1], value) || isServiceLinkName(match[1]) {
 					signals = append(signals, environmentSignal{name: match[1], value: value, evidence: filepath.ToSlash(rel), consumer: service.Name})
 				}
 			}
 		}
 	}
 	signals = append(signals, readComposeEnvironmentSignals(root, services)...)
-	return signals
+	return prioritizeSignals(signals)
+}
+
+func prioritizeSignals(signals []environmentSignal) []environmentSignal {
+	process := map[string]string{}
+	for _, entry := range os.Environ() {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && (isServiceLinkName(name) || strings.HasSuffix(name, "_PORT")) {
+			process[name] = value
+		}
+	}
+	processNames := make([]string, 0, len(process))
+	for name := range process {
+		processNames = append(processNames, name)
+	}
+	sort.Strings(processNames)
+	result := make([]environmentSignal, 0, len(signals)+len(processNames))
+	for _, name := range processNames {
+		result = append(result, environmentSignal{name: name, value: process[name], evidence: "process environment"})
+	}
+	seen := map[string]bool{}
+	global := map[string]bool{}
+	for _, signal := range signals {
+		if _, overridden := process[signal.name]; overridden || global[signal.name] {
+			continue
+		}
+		key := signal.consumer + "\x00" + signal.name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if signal.consumer == "" {
+			global[signal.name] = true
+		}
+		result = append(result, signal)
+	}
+	return result
 }
 
 func readComposeEnvironmentSignals(root string, services []Service) []environmentSignal {
@@ -155,7 +192,7 @@ func readComposeEnvironmentSignals(root string, services []Service) []environmen
 				continue
 			}
 			value := cleanEnvironmentValue(match[2])
-			if !isNamedPort(match[1], value) && !isLocalHTTPValue(value) {
+			if !isNamedPort(match[1], value) && !isServiceLinkName(match[1]) {
 				continue
 			}
 			consumer := composeConsumer(composeService, services)
@@ -369,6 +406,7 @@ func serviceProfile(service Service) models.Profile {
 }
 
 func applyRouteAlias(plan *Plan, route Route, target EndpointRef, hostname string) {
+	hostname = devrun.ApplyWorktreePrefix(hostname, plan.Project.Worktree)
 	for serviceIndex := range plan.Services {
 		if plan.Services[serviceIndex].Name != target.Service {
 			continue
@@ -412,11 +450,6 @@ func isNamedPort(name, value string) bool {
 	}
 	port, err := strconv.Atoi(value)
 	return err == nil && port > 0 && port <= 65535
-}
-
-func isLocalHTTPValue(value string) bool {
-	_, ok := localHTTPEndpoint(value)
-	return ok
 }
 
 func localHTTPEndpoint(value string) (*url.URL, bool) {

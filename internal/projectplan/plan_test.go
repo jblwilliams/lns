@@ -220,6 +220,31 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/peyra
 	}
 }
 
+func TestExplicitRemoteEnvironmentBlocksLocalExampleInference(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name":"demo", "private":true,
+  "scripts":{"dev":"vite","server":"node server.js"},
+  "dependencies":{"express":"^5"}, "devDependencies":{"vite":"^7"}
+}`)
+	mustWrite(t, filepath.Join(root, ".env"), "VITE_API_URL=https://staging.example.com\n")
+	mustWrite(t, filepath.Join(root, ".env.example"), "VITE_API_URL=http://localhost:3001\n")
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL")
+
+	t.Setenv("VITE_API_URL", "https://shell.example.com")
+	mustWrite(t, filepath.Join(root, ".env"), "VITE_API_URL=http://localhost:3001\n")
+	plan, err = Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL")
+}
+
 func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "package.json"), `{"name":"momentum","private":true,"workspaces":["web","server-ts","desktop","reader-mode"]}`)
@@ -257,6 +282,18 @@ func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {
 	assertNoBinding(t, web, "API_PROXY_TARGET")
 	reader := serviceNamed(t, plan, "reader-mode")
 	assertBinding(t, reader, "API_PROXY_TARGET", BindingURL, "server-ts")
+}
+
+func TestRouteAliasPreservesWorktreePrefix(t *testing.T) {
+	plan := Plan{
+		Project:  Project{Name: "momentum", Worktree: "fix-auth"},
+		Services: []Service{{Name: "server-ts", Listeners: []Listener{{Name: "http", Public: true}}}},
+	}
+	applyRouteAlias(&plan, Route{Scheme: "http", Port: 80}, EndpointRef{Service: "server-ts", Listener: "http"}, "momentum-api.localhost")
+	listener := plan.Services[0].Listeners[0]
+	if listener.Hostname != "fix-auth.momentum-api.localhost" || listener.URL != "http://fix-auth.momentum-api.localhost" {
+		t.Fatalf("route alias lost worktree identity: %#v", listener)
+	}
 }
 
 func TestBuildRetainsMeaningfulWrapperAndInfersCompoundListeners(t *testing.T) {

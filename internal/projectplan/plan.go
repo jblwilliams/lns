@@ -276,7 +276,7 @@ func Build(root string, route Route) (Plan, error) {
 		plan.Warnings = append(plan.Warnings, Warning{
 			Code:     "no-services",
 			Message:  "no runnable HTTP services were discovered",
-			Recovery: "run `lns init`, then describe the service explicitly",
+			Recovery: fmt.Sprintf("create lns.json with {\"name\":%q,\"services\":{\"web\":{\"root\":\".\",\"script\":\"dev\"}}}, then run `lns plan`", plan.Project.Name),
 		})
 	}
 	sort.Slice(plan.Warnings, func(i, j int) bool {
@@ -288,8 +288,8 @@ func Build(root string, route Route) (Plan, error) {
 	return plan, nil
 }
 
-// ProjectName returns the canonical discovered project identity used by plan,
-// init, and the bare run path.
+// ProjectName returns the canonical discovered project identity used by plan
+// and the bare run path.
 func ProjectName(root string) string {
 	if absolute, err := filepath.Abs(root); err == nil {
 		root = absolute

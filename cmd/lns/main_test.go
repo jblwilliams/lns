@@ -181,6 +181,33 @@ export default {server:{port,proxy:{"/api":{target:apiTarget}}}}
 	}
 }
 
+func TestExpandServiceClosureIncludesRequiredServicesCycleSafely(t *testing.T) {
+	plan := projectplan.Plan{Services: []projectplan.Service{
+		{Name: "api", State: projectplan.StateManaged, Environment: []projectplan.EnvironmentBinding{{Name: "CORS_ORIGIN", Target: projectplan.EndpointRef{Service: "web", Listener: "http"}}}},
+		{Name: "web", State: projectplan.StateManaged, Environment: []projectplan.EnvironmentBinding{
+			{Name: "VITE_API_URL", Target: projectplan.EndpointRef{Service: "api", Listener: "http"}},
+			{Name: "VITE_API_TARGET", Target: projectplan.EndpointRef{Service: "web", Listener: "api"}},
+		}},
+	}}
+	selected, err := expandServiceClosure(plan, []projectplan.Service{plan.Services[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := serviceNames(selected), []string{"api", "web"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("service closure: want %#v, got %#v", want, got)
+	}
+}
+
+func TestExpandServiceClosureRejectsUnrunnableRequirement(t *testing.T) {
+	plan := projectplan.Plan{Services: []projectplan.Service{
+		{Name: "api", State: projectplan.StateUnresolved},
+		{Name: "web", State: projectplan.StateManaged, Environment: []projectplan.EnvironmentBinding{{Name: "VITE_API_URL", Target: projectplan.EndpointRef{Service: "api", Listener: "http"}}}},
+	}}
+	if _, err := expandServiceClosure(plan, []projectplan.Service{plan.Services[1]}); err == nil {
+		t.Fatal("expected an unresolved required service to fail before runtime mutation")
+	}
+}
+
 func containsEnv(env []string, want string) bool {
 	for _, value := range env {
 		if value == want {

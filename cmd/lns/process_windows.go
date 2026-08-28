@@ -7,7 +7,15 @@ import (
 	"os/exec"
 )
 
-func detachProcess(command *exec.Cmd) {}
+func configureChildProcess(command *exec.Cmd) {}
+
+func interruptChildProcess(command *exec.Cmd) error {
+	return command.Process.Signal(os.Interrupt)
+}
+
+func killChildProcess(command *exec.Cmd) error {
+	return command.Process.Kill()
+}
 
 func handledSignals() []os.Signal {
 	return []os.Signal{os.Interrupt}

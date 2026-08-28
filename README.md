@@ -9,7 +9,7 @@ lns
 
 There is no required project configuration and no repository write on first run. LNS inspects existing development scripts, workspaces, environment examples, and the canonical local Compose file in memory. Developers who do not run LNS are unaffected.
 
-Typical routes are plain HTTP names with no visible port:
+Typical routes are plain HTTP names with no visible port. The proxy binds only to loopback, and child processes receive `HOST=127.0.0.1`:
 
 ```text
 http://my-app.localhost
@@ -91,16 +91,29 @@ LNS deliberately does not invent a project-specific database bootstrap. Existing
 
 LNS does not require a checked-in file, install a package hook, replace a project's normal scripts, or change Docker metadata. A developer can try it in an existing checkout and stop using it without leaving repository changes behind.
 
-An `lns.json` file is still accepted as an explicit override for unusual repositories, but it is not the normal setup path.
+An `lns.json` file is still accepted as a strict local-run override for unusual repositories, but it is not the normal setup path:
+
+```json
+{
+  "name": "my-app",
+  "services": {
+    "web": { "root": "apps/web", "script": "dev" }
+  }
+}
+```
+
+It contains local command intent only. Docker, staging, production, and fixed-port fields are deliberately not part of this file.
 
 ## Worktrees
 
-Linked Git worktrees get an additional branch label and independent process ports:
+Linked Git worktrees get an additional branch label and independent application ports:
 
 ```text
 main checkout:       http://my-app.localhost
 fix-auth worktree:   http://fix-auth.my-app.localhost
 ```
+
+If multiple worktrees intentionally share one explicitly named Compose project, LNS allows only one of them to own that dependency stack at a time. The second run fails with the owning PID instead of recreating or stopping the first worktree's database.
 
 ## Useful commands
 
@@ -110,7 +123,7 @@ lns plan                    # explain the plan without changing state
 lns plan --json             # machine-readable plan only
 lns run <service>           # explicitly run one inventory service
 lns run <service> -- <cmd>  # one-run command override
-lns doctor                  # check Caddy, state, and setup
+lns doctor                  # check Caddy and Docker requirements
 lns config                  # show global state paths
 lns stop                    # stop the shared Caddy proxy
 ```
@@ -124,9 +137,8 @@ LNS keeps machine-local state under `~/.lns`:
 - `runtime.json`: process-owned routes
 - `Caddyfile` and `projects/00-runtime.caddy`: generated process-owned proxy configuration
 - `dependencies/`: short-lived Compose overrides and ownership records
-- `settings.json`: the Caddy admin address
 
-The public route contract is always `http://*.localhost` on port 80. Legacy HTTPS or proxy-port values in an older settings file do not change a bare run.
+The route contract is always `http://*.localhost` on port 80. Caddy control is fixed to `127.0.0.1:20190`.
 
 ## Development
 

@@ -16,7 +16,7 @@ func TestRuntimeCaddyfileRoutesStandardAndHMRLeases(t *testing.T) {
 		{Hostname: "demo-web.localhost", Port: 4312, Profile: models.ProfileHMR},
 		{Hostname: "demo-api.localhost", Port: 4313, Profile: models.ProfileStandard},
 	}, 80, false)
-	for _, want := range []string{"http://demo-web.localhost:80", "reverse_proxy 127.0.0.1:4312", "header_up Host {host}", "http://demo-api.localhost:80", "reverse_proxy 127.0.0.1:4313"} {
+	for _, want := range []string{"http://demo-web.localhost:80", "bind 127.0.0.1 ::1", "reverse_proxy 127.0.0.1:4312", "header_up Host {host}", "http://demo-api.localhost:80", "reverse_proxy 127.0.0.1:4313"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("missing %q:\n%s", want, content)
 		}
@@ -25,9 +25,12 @@ func TestRuntimeCaddyfileRoutesStandardAndHMRLeases(t *testing.T) {
 
 func TestGlobalCaddyfileImportsOnlyRuntimeRoutes(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	content := GenerateGlobalCaddyfile(80, "127.0.0.1:20190")
+	content := GenerateGlobalCaddyfile(80)
 	if !strings.Contains(content, config.GetRuntimeCaddyfilePath()) || strings.Contains(content, "*.caddy") {
 		t.Fatalf("global config must import only process-owned routes:\n%s", content)
+	}
+	if !strings.Contains(content, "admin "+config.CaddyAdminAddr) || strings.Contains(content, "admin 0.0.0.0") {
+		t.Fatalf("Caddy control endpoint must stay on canonical loopback:\n%s", content)
 	}
 }
 

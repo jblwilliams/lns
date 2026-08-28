@@ -8,8 +8,16 @@ import (
 	"syscall"
 )
 
-func detachProcess(command *exec.Cmd) {
+func configureChildProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func interruptChildProcess(command *exec.Cmd) error {
+	return syscall.Kill(-command.Process.Pid, syscall.SIGINT)
+}
+
+func killChildProcess(command *exec.Cmd) error {
+	return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 }
 
 func handledSignals() []os.Signal {

@@ -20,11 +20,13 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"lns/internal/config"
 	"lns/internal/devrun"
 	"lns/internal/discovery"
 	"lns/internal/projectplan"
+	"lns/internal/state"
 )
 
 type Request struct {
@@ -90,15 +92,11 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 		return nil, fmt.Errorf("create dependency state: %w", err)
 	}
 	project := runtimeProject(request.Project, root, request.Worktree)
-	ownerPath := filepath.Join(stateDir, project+".owner.json")
-	if err := claimOwner(ownerPath); err != nil {
-		return nil, err
-	}
-	session := &Session{overrides: map[string]map[string]string{}, runner: runner, ownerPath: ownerPath}
+	session := &Session{overrides: map[string]map[string]string{}, runner: runner}
 	failed := true
 	defer func() {
-		if failed {
-			_ = os.Remove(ownerPath)
+		if failed && session.ownerPath != "" && len(session.started) == 0 {
+			_ = os.Remove(session.ownerPath)
 		}
 	}()
 
@@ -121,6 +119,30 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 	if len(providers) == 0 && len(backgrounds) == 0 {
 		failed = false
 		return session, nil
+	}
+	ownerPath := filepath.Join(stateDir, composeOwner(model.Name, root)+".owner.json")
+	stale, err := claimOwner(ownerPath)
+	if err != nil {
+		return nil, err
+	}
+	session.ownerPath = ownerPath
+	if len(stale.Started) > 0 {
+		session.command = base
+		session.started = stale.Started
+		if err := writeOwner(ownerPath, session.started, stale.Override); err != nil {
+			return nil, fmt.Errorf("record stale Docker dependency ownership: %w", err)
+		}
+		if _, err := runner.Run(ctx, root, environment, "docker", composeArgs(base, append([]string{"stop"}, stale.Started...)...)...); err != nil {
+			failed = false // preserve the record so the next run can retry cleanup
+			return nil, fmt.Errorf("stop stale LNS Docker dependencies: %w", err)
+		}
+		if filepath.Dir(filepath.Clean(stale.Override)) == filepath.Clean(stateDir) {
+			_ = os.Remove(stale.Override)
+		}
+		session.started = nil
+		if err := writeOwner(ownerPath, nil, ""); err != nil {
+			return nil, fmt.Errorf("clear stale Docker dependency ownership: %w", err)
+		}
 	}
 	runningOutput, err := runner.Run(ctx, root, environment, "docker", composeArgs(inspect, "ps", "--status", "running", "--services")...)
 	if err != nil {
@@ -168,25 +190,34 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 	}
 	names := sortedKeys(managedNames)
 	session.started = names // rollback even if Compose fails partway through up
+	if err := writeOwner(session.ownerPath, session.started, base.override); err != nil {
+		return nil, fmt.Errorf("record Docker dependency ownership: %w", err)
+	}
 	if _, err := runner.Run(ctx, root, environment, "docker", composeArgs(base, append([]string{"up", "-d", "--wait"}, names...)...)...); err != nil {
-		_ = session.Close(ctx)
+		closeAfterFailure(session)
 		return nil, fmt.Errorf("start Docker dependencies: %w", err)
 	}
 	for _, provider := range managedProviders {
 		output, err := runner.Run(ctx, root, environment, "docker", composeArgs(base, "port", provider.Name, strconv.Itoa(provider.Target))...)
 		if err != nil {
-			_ = session.Close(ctx)
+			closeAfterFailure(session)
 			return nil, fmt.Errorf("read %s host port: %w", provider.Name, err)
 		}
 		provider.Port, err = publishedPort(string(output))
 		if err != nil {
-			_ = session.Close(ctx)
+			closeAfterFailure(session)
 			return nil, fmt.Errorf("read %s host port: %w", provider.Name, err)
 		}
 		applyProviderOverrides(session.overrides, root, request.Services, dotenv, provider)
 	}
 	failed = false
 	return session, nil
+}
+
+func closeAfterFailure(session *Session) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = session.Close(ctx)
 }
 
 func (session *Session) Overrides(service string) map[string]string {
@@ -204,6 +235,9 @@ func (session *Session) Close(ctx context.Context) error {
 	var closeErr error
 	if len(session.started) > 0 {
 		_, closeErr = session.runner.Run(ctx, session.command.root, session.command.environment, "docker", composeArgs(session.command, append([]string{"stop"}, session.started...)...)...)
+		if closeErr != nil {
+			return fmt.Errorf("stop Docker dependencies: %w", closeErr)
+		}
 		session.started = nil
 	}
 	if session.command.override != "" {
@@ -211,9 +245,6 @@ func (session *Session) Close(ctx context.Context) error {
 	}
 	if session.ownerPath != "" {
 		_ = os.Remove(session.ownerPath)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("stop Docker dependencies: %w", closeErr)
 	}
 	return nil
 }
@@ -260,35 +291,52 @@ func runtimeProject(project, root, worktree string) string {
 	return strings.Trim(name, "-")
 }
 
-func claimOwner(path string) error {
-	data, _ := json.Marshal(struct {
-		PID int `json:"pid"`
-	}{PID: os.Getpid()})
-	for attempts := 0; attempts < 2; attempts++ {
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err == nil {
-			_, writeErr := file.Write(data)
-			closeErr := file.Close()
-			if writeErr != nil {
-				return writeErr
-			}
-			return closeErr
+type ownerRecord struct {
+	PID      int      `json:"pid"`
+	Started  []string `json:"started,omitempty"`
+	Override string   `json:"override,omitempty"`
+}
+
+func claimOwner(path string) (ownerRecord, error) {
+	data, _ := json.Marshal(ownerRecord{PID: os.Getpid()})
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err == nil {
+		_, writeErr := file.Write(data)
+		closeErr := file.Close()
+		if writeErr != nil {
+			return ownerRecord{}, writeErr
 		}
-		if !os.IsExist(err) {
-			return err
-		}
-		existing, _ := os.ReadFile(path)
-		var owner struct {
-			PID int `json:"pid"`
-		}
-		if json.Unmarshal(existing, &owner) == nil && processAlive(owner.PID) {
-			return fmt.Errorf("Docker dependencies are already owned by LNS process %d", owner.PID)
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
+		return ownerRecord{}, closeErr
 	}
-	return fmt.Errorf("could not claim Docker dependency ownership")
+	if !os.IsExist(err) {
+		return ownerRecord{}, err
+	}
+	existing, _ := os.ReadFile(path)
+	var stale ownerRecord
+	if json.Unmarshal(existing, &stale) == nil && processAlive(stale.PID) {
+		return ownerRecord{}, fmt.Errorf("Docker dependencies are already owned by LNS process %d; stop that run before starting this Compose project", stale.PID)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return ownerRecord{}, err
+	}
+	file, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return ownerRecord{}, err
+	}
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return ownerRecord{}, writeErr
+	}
+	return stale, closeErr
+}
+
+func writeOwner(path string, started []string, override string) error {
+	data, err := json.Marshal(ownerRecord{PID: os.Getpid(), Started: started, Override: override})
+	if err != nil {
+		return err
+	}
+	return state.WriteFileAtomic(path, data, 0600)
 }
 
 func processAlive(pid int) bool {
@@ -300,9 +348,18 @@ func processAlive(pid int) bool {
 }
 
 type composeModel struct {
+	Name     string                         `json:"name"`
 	Services map[string]composeService      `json:"services"`
 	Volumes  map[string]composeNamedVolume  `json:"volumes"`
 	Networks map[string]composeNamedNetwork `json:"networks"`
+}
+
+func composeOwner(name, root string) string {
+	if name = discovery.NormalizeName(name); name != "" {
+		return "compose-" + name
+	}
+	hash := sha256.Sum256([]byte(root))
+	return "compose-" + hex.EncodeToString(hash[:8])
 }
 
 type composeService struct {
@@ -556,11 +613,11 @@ func publishedPort(value string) (int, error) {
 }
 
 func dotenvByService(root string, services []projectplan.Service) map[string]map[string]string {
-	rootValues := readDotenv(filepath.Join(root, ".env"))
+	rootValues := readDotenvLayers(root)
 	result := map[string]map[string]string{}
 	for _, service := range services {
 		values := cloneValues(rootValues)
-		for key, value := range readDotenv(filepath.Join(root, service.Root, ".env")) {
+		for key, value := range readDotenvLayers(filepath.Join(root, service.Root)) {
 			values[key] = value
 		}
 		for _, entry := range os.Environ() {
@@ -570,6 +627,16 @@ func dotenvByService(root string, services []projectplan.Service) map[string]map
 			}
 		}
 		result[service.Name] = values
+	}
+	return result
+}
+
+func readDotenvLayers(root string) map[string]string {
+	result := map[string]string{}
+	for _, name := range []string{".env", ".env.development", ".env.local", ".env.development.local"} {
+		for key, value := range readDotenv(filepath.Join(root, name)) {
+			result[key] = value
+		}
 	}
 	return result
 }
@@ -774,7 +841,7 @@ func rewriteLocalURL(value string, port int, providerHost string, schemes ...str
 	}
 	allowedScheme := false
 	for _, scheme := range schemes {
-		allowedScheme = allowedScheme || parsed.Scheme == scheme
+		allowedScheme = allowedScheme || parsed.Scheme == scheme || strings.HasPrefix(parsed.Scheme, scheme+"+")
 	}
 	host := strings.ToLower(parsed.Hostname())
 	local := localProviderHost(host, providerHost)

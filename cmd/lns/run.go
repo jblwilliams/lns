@@ -69,11 +69,13 @@ func runOneCommand(cmd *cobra.Command, args []string) error {
 }
 
 func runConfiguredServices(names, override []string, requestedPort int) error {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), handledSignals()...)
+	defer stopSignals()
+	return runConfiguredServicesContext(ctx, names, override, requestedPort)
+}
+
+func runConfiguredServicesContext(ctx context.Context, names, override []string, requestedPort int) error {
 	root, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	settings, err := config.LoadSettings()
 	if err != nil {
 		return err
 	}
@@ -104,29 +106,43 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	if len(names) == 0 {
 		return fmt.Errorf("no unambiguous default services; run `lns plan`, then choose one with `lns run <service>`")
 	}
-	if requestedPort > 0 && len(names) != 1 {
-		return fmt.Errorf("--port can only be used when running one service")
-	}
+	requestedNames := strings.Join(names, ", ")
 	selected, err := servicesByName(plan, names)
 	if err != nil {
 		return err
+	}
+	selected, err = expandServiceClosure(plan, selected)
+	if err != nil {
+		return err
+	}
+	names = serviceNames(selected)
+	if requestedPort > 0 && len(names) != 1 {
+		return fmt.Errorf("--port cannot be used because %q requires the service graph %s; omit --port to use dynamic ports", requestedNames, strings.Join(names, ", "))
 	}
 	for _, service := range selected {
 		if service.State != projectplan.StateManaged {
 			return fmt.Errorf("service %q is %s and cannot be started; run `lns plan` for recovery", service.Name, service.State)
 		}
 	}
-	dependencies, err := dependencyruntime.Start(context.Background(), dependencyruntime.Request{
+	dependencies, err := dependencyruntime.Start(ctx, dependencyruntime.Request{
 		Root: root, Project: plan.Project.Name, Worktree: plan.Project.Worktree, Services: selected,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	defer func() {
-		if err := dependencies.Close(context.Background()); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := dependencies.Close(cleanupCtx); err != nil {
 			printWarning("Could not stop Docker dependencies: %v", err)
 		}
 	}()
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	store := devruntime.NewStore()
 	activeLeases, err := store.Load()
@@ -176,26 +192,33 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	}
 
 	registered := make([]serviceRun, 0, len(runs))
+	defer func() { cleanupRuns(store, registered) }()
 	for _, run := range runs {
 		for _, lease := range run.Leases {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err := store.Add(lease); err != nil {
-				cleanupRuns(store, registered, settings)
 				return err
 			}
 			registered = append(registered, serviceRun{Name: run.Name, Leases: []devruntime.Lease{lease}})
 		}
 	}
-	if err := ensureProxyReady(settings); err != nil {
-		cleanupRuns(store, registered, settings)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err := ensureProxyReady(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
-	defer cleanupRuns(store, registered, settings)
 
 	for _, run := range runs {
 		printSuccess("%s", run.URL)
 		fmt.Printf("  %s\n", strings.Join(run.Command, " "))
 	}
-	return executeRuns(runs)
+	return executeRuns(ctx, runs)
 }
 
 func prepareServiceRun(projectRoot string, plan projectplan.Plan, service projectplan.Service, ports map[string]int, pid int) (serviceRun, error) {
@@ -345,6 +368,52 @@ func servicesByName(plan projectplan.Plan, names []string) ([]projectplan.Servic
 	return result, nil
 }
 
+func expandServiceClosure(plan projectplan.Plan, selected []projectplan.Service) ([]projectplan.Service, error) {
+	included := make(map[string]bool, len(selected))
+	queue := make([]projectplan.Service, 0, len(selected))
+	for _, service := range selected {
+		if !included[service.Name] {
+			included[service.Name] = true
+			queue = append(queue, service)
+		}
+	}
+	for len(queue) > 0 {
+		service := queue[0]
+		queue = queue[1:]
+		for _, binding := range service.Environment {
+			targetName := binding.Target.Service
+			if targetName == "" || included[targetName] {
+				continue
+			}
+			target, err := serviceByName(plan, targetName)
+			if err != nil {
+				return nil, fmt.Errorf("service %q requires %q: %w", service.Name, targetName, err)
+			}
+			if target.State != projectplan.StateManaged {
+				return nil, fmt.Errorf("service %q requires %q, but it is %s; run `lns plan` for recovery", service.Name, targetName, target.State)
+			}
+			included[targetName] = true
+			queue = append(queue, target)
+		}
+	}
+	result := make([]projectplan.Service, 0, len(included))
+	for _, service := range plan.Services {
+		if included[service.Name] {
+			result = append(result, service)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+func serviceNames(services []projectplan.Service) []string {
+	names := make([]string, len(services))
+	for index, service := range services {
+		names[index] = service.Name
+	}
+	return names
+}
+
 func publicListener(service projectplan.Service) (projectplan.Listener, bool) {
 	for _, listener := range service.Listeners {
 		if listener.Public {
@@ -385,7 +454,7 @@ func replaceService(plan *projectplan.Plan, replacement projectplan.Service) {
 	}
 }
 
-func ensureProxyReady(settings config.Settings) error {
+func ensureProxyReady(ctx context.Context) error {
 	caddyPath, err := exec.LookPath("caddy")
 	if err != nil {
 		return fmt.Errorf("Caddy is not installed or not in PATH")
@@ -394,8 +463,8 @@ func ensureProxyReady(settings config.Settings) error {
 		return fmt.Errorf("generate Caddy config: %w", err)
 	}
 	global := config.GetGlobalCaddyfilePath()
-	if isTCPListening(settings.AdminAddr) {
-		command := exec.Command(caddyPath, "reload", "--config", global, "--address", settings.AdminAddr)
+	if isTCPListening(config.CaddyAdminAddr) {
+		command := exec.CommandContext(ctx, caddyPath, "reload", "--config", global, "--address", config.CaddyAdminAddr)
 		command.Stdout = os.Stdout
 		command.Stderr = os.Stderr
 		if err := command.Run(); err != nil {
@@ -403,28 +472,42 @@ func ensureProxyReady(settings config.Settings) error {
 		}
 		return nil
 	}
-	return startCaddy(caddyPath, global, config.DefaultHTTPPort)
+	return startCaddy(ctx, caddyPath, global, config.DefaultHTTPPort)
 }
 
-func executeRuns(runs []serviceRun) error {
+func executeRuns(ctx context.Context, runs []serviceRun) error {
+	return executeRunsWithFactory(ctx, runs, exec.Command)
+}
+
+func executeRunsWithFactory(ctx context.Context, runs []serviceRun, newCommand func(string, ...string) *exec.Cmd) error {
 	type result struct {
 		name string
 		err  error
 	}
 	results := make(chan result, len(runs))
-	interrupts := make(chan os.Signal, 1)
-	signal.Notify(interrupts, handledSignals()...)
-	defer signal.Stop(interrupts)
 	commands := make([]*exec.Cmd, 0, len(runs))
 	for _, run := range runs {
-		command := exec.Command(run.Command[0], run.Command[1:]...)
+		if ctx.Err() != nil {
+			finishInterrupt := interruptCommands(commands)
+			for range commands {
+				<-results
+			}
+			finishInterrupt()
+			return nil
+		}
+		command := newCommand(run.Command[0], run.Command[1:]...)
 		command.Dir = run.Root
 		command.Env = run.Env
 		command.Stdin = os.Stdin
 		command.Stdout = os.Stdout
 		command.Stderr = os.Stderr
+		configureChildProcess(command)
 		if err := command.Start(); err != nil {
-			interruptCommands(commands)
+			finishInterrupt := interruptCommands(commands)
+			for range commands {
+				<-results
+			}
+			finishInterrupt()
 			return fmt.Errorf("start %s: %w", run.Name, err)
 		}
 		commands = append(commands, command)
@@ -434,15 +517,17 @@ func executeRuns(runs []serviceRun) error {
 	var first result
 	select {
 	case first = <-results:
-		interruptCommands(commands)
+		finishInterrupt := interruptCommands(commands)
 		for i := 1; i < len(commands); i++ {
 			<-results
 		}
-	case <-interrupts:
-		interruptCommands(commands)
+		finishInterrupt()
+	case <-ctx.Done():
+		finishInterrupt := interruptCommands(commands)
 		for range commands {
 			<-results
 		}
+		finishInterrupt()
 		return nil
 	}
 	if first.err != nil && !interruptedExit(first.err) {
@@ -451,21 +536,32 @@ func executeRuns(runs []serviceRun) error {
 	return nil
 }
 
-func interruptCommands(commands []*exec.Cmd) {
+func interruptCommands(commands []*exec.Cmd) func() {
 	for _, command := range commands {
 		if command.Process == nil {
 			continue
 		}
-		_ = command.Process.Signal(os.Interrupt)
-		process := command.Process
-		go func() {
-			time.Sleep(2 * time.Second)
-			_ = process.Kill()
-		}()
+		_ = interruptChildProcess(command)
+	}
+	timer := time.AfterFunc(2*time.Second, func() { killCommands(commands) })
+	return func() {
+		timer.Stop()
+		// A command can exit before one of its descendants. Kill the detached
+		// process group after every leader has been reaped so no watcher or
+		// sidecar survives LNS cleanup.
+		killCommands(commands)
 	}
 }
 
-func cleanupRuns(store *devruntime.Store, runs []serviceRun, settings config.Settings) {
+func killCommands(commands []*exec.Cmd) {
+	for _, command := range commands {
+		if command.Process != nil {
+			_ = killChildProcess(command)
+		}
+	}
+}
+
+func cleanupRuns(store *devruntime.Store, runs []serviceRun) {
 	for _, run := range runs {
 		for _, lease := range run.Leases {
 			if err := store.Remove(lease.Project, lease.Service, lease.Worktree, lease.PID); err != nil {
@@ -477,8 +573,10 @@ func cleanupRuns(store *devruntime.Store, runs []serviceRun, settings config.Set
 		printWarning("Could not regenerate Caddy config during cleanup: %v", err)
 		return
 	}
-	if isTCPListening(settings.AdminAddr) {
-		command := exec.Command("caddy", "reload", "--config", config.GetGlobalCaddyfilePath(), "--address", settings.AdminAddr)
+	if isTCPListening(config.CaddyAdminAddr) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, "caddy", "reload", "--config", config.GetGlobalCaddyfilePath(), "--address", config.CaddyAdminAddr)
 		if err := command.Run(); err != nil {
 			printWarning("Could not reload Caddy during cleanup: %v", err)
 		}
