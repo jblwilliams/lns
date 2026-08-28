@@ -35,6 +35,9 @@ var rootCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	Long: `lns discovers or reads repo-local service configuration, leases dynamic
 development ports, and routes stable HTTPS names through Caddy.`,
+	Example: `  lns
+  lns plan
+  lns run web`,
 }
 
 func init() {
