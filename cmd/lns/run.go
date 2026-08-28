@@ -19,6 +19,7 @@ import (
 	"lns/internal/discovery"
 	"lns/internal/models"
 	"lns/internal/projectconfig"
+	"lns/internal/projectplan"
 )
 
 type serviceRun struct {
@@ -250,7 +251,7 @@ func loadOrBootstrapConfig(root string) (*projectconfig.Config, error) {
 		}
 		return cfg, nil
 	}
-	cfg := discovery.BootstrapConfig(filepath.Base(root), root, "")
+	cfg := discovery.BootstrapConfig(projectplan.ProjectName(root), root, "")
 	if err := projectconfig.Save(root, cfg); err != nil {
 		return nil, err
 	}

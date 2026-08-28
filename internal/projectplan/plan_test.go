@@ -17,7 +17,7 @@ func TestBuildDiscoversPlanWithoutWritingRepository(t *testing.T) {
 }`)
 	before := mustEntries(t, root)
 
-	plan, err := Build(root)
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestBuildUsesExplicitConfigWithoutRepairingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	plan, err := Build(root)
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestBuildSortsServicesAndEvidence(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "apps", "zeta", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
 	mustWrite(t, filepath.Join(root, "apps", "alpha", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
 
-	plan, err := Build(root)
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +101,88 @@ func TestBuildSortsServicesAndEvidence(t *testing.T) {
 		if !reflect.DeepEqual(service.Evidence, []string{"package.json", "package.json script dev"}) {
 			t.Fatalf("evidence not sorted for %s: %v", service.Name, service.Evidence)
 		}
+	}
+}
+
+func TestBuildUsesRouteSettingsAndCanonicalScopedName(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name": "@acme/store",
+  "private": true,
+  "scripts": {"dev": "vite"},
+  "devDependencies": {"vite": "^7"}
+}`)
+
+	plan, err := Build(root, Route{Scheme: "https", Port: 8443})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ProjectName(root); got != "acme-store" {
+		t.Fatalf("expected canonical scoped name, got %q", got)
+	}
+	if plan.Services[0].URL != "https://acme-store.localhost:8443" {
+		t.Fatalf("unexpected routed URL: %q", plan.Services[0].URL)
+	}
+}
+
+func TestBuildSurfacesUnresolvedAndExternalServicesHonestly(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "lns.json"), `{
+  "name": "demo",
+  "services": {
+    "broken": {"root": ".", "script": "dev", "status": "unresolved"},
+    "proxy": {"root": ".", "port": 9000, "profile": "standard", "status": "resolved"}
+  }
+}`)
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if plan.Services[0].Name != "broken" || plan.Services[0].State != StateUnresolved || plan.Services[0].Port.Strategy != PortUnresolved {
+		t.Fatalf("unexpected unresolved service: %#v", plan.Services[0])
+	}
+	if plan.Services[1].Name != "proxy" || plan.Services[1].State != StateExternal || plan.Services[1].Port.Strategy != PortFixed || plan.Services[1].Port.Fixed != 9000 {
+		t.Fatalf("unexpected external service: %#v", plan.Services[1])
+	}
+	if len(plan.Warnings) != 1 || plan.Warnings[0].Code != "unresolved-service" {
+		t.Fatalf("expected one unresolved warning, got %#v", plan.Warnings)
+	}
+	if plan.Warnings[0].Recovery != "edit lns.json and set a valid profile plus script, command, or port" {
+		t.Fatalf("unexpected recovery: %#v", plan.Warnings[0])
+	}
+}
+
+func TestBuildKeepsPortEvidenceAttachedToPortSource(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name": "demo",
+  "private": true,
+  "scripts": {"dev": "vite"},
+  "devDependencies": {"vite": "^7"}
+}`)
+	mustWrite(t, filepath.Join(root, ".env"), "VITE_PORT=4173\n")
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	observed := plan.Services[0].Port.Observed
+	if len(observed) != 1 || observed[0].Value != 4173 || observed[0].Evidence != ".env" {
+		t.Fatalf("unexpected observed port provenance: %#v", observed)
+	}
+}
+
+func TestBuildWarnsWhenNoServicesAreDiscovered(t *testing.T) {
+	plan, err := Build(t.TempDir(), Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Services) != 0 || len(plan.Warnings) != 1 || plan.Warnings[0].Code != "no-services" {
+		t.Fatalf("unexpected empty plan: %#v", plan)
 	}
 }
 

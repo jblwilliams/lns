@@ -22,14 +22,15 @@ var (
 )
 
 type DetectedService struct {
-	Name     string
-	Root     string
-	Port     int
-	Script   string
-	Profile  models.Profile
-	Status   models.ServiceStatus
-	Source   models.ServiceSource
-	Evidence []string
+	Name         string
+	Root         string
+	Port         int
+	PortEvidence string
+	Script       string
+	Profile      models.Profile
+	Status       models.ServiceStatus
+	Source       models.ServiceSource
+	Evidence     []string
 }
 
 type Drift struct {
@@ -57,7 +58,7 @@ func BootstrapConfig(projectName, projectRoot, prefix string) *projectconfig.Con
 			Evidence: []string{"no services detected from common repo signals"},
 		}}
 	} else if len(detected) == 1 && detected[0].Root == "." {
-		if name := sanitizeName(projectName); name != "" {
+		if name := NormalizeName(projectName); name != "" {
 			detected[0].Name = name
 		}
 	}
@@ -240,14 +241,15 @@ func inspectRoot(projectRoot, relRoot string) (DetectedService, bool) {
 	}
 
 	return DetectedService{
-		Name:     deriveServiceName(projectRoot, relRoot),
-		Root:     relRoot,
-		Port:     port,
-		Script:   script,
-		Profile:  profile,
-		Status:   status,
-		Source:   models.SourceDetected,
-		Evidence: evidence,
+		Name:         deriveServiceName(projectRoot, relRoot),
+		Root:         relRoot,
+		Port:         port,
+		PortEvidence: portSource,
+		Script:       script,
+		Profile:      profile,
+		Status:       status,
+		Source:       models.SourceDetected,
+		Evidence:     evidence,
 	}, true
 }
 
@@ -295,15 +297,21 @@ func detectSiblingScriptServices(projectRoot, relRoot, primaryScript string) []D
 			continue
 		}
 		seen[candidate.name] = true
+		port := findPort(command)
+		portEvidence := ""
+		if port > 0 {
+			portEvidence = "package.json script " + candidate.script
+		}
 		services = append(services, DetectedService{
-			Name:     candidate.name,
-			Root:     cleanRoot(relRoot),
-			Port:     findPort(command),
-			Script:   candidate.script,
-			Profile:  models.ProfileStandard,
-			Status:   models.StatusResolved,
-			Source:   models.SourceDetected,
-			Evidence: []string{"package.json script " + candidate.script},
+			Name:         candidate.name,
+			Root:         cleanRoot(relRoot),
+			Port:         port,
+			PortEvidence: portEvidence,
+			Script:       candidate.script,
+			Profile:      models.ProfileStandard,
+			Status:       models.StatusResolved,
+			Source:       models.SourceDetected,
+			Evidence:     []string{"package.json script " + candidate.script},
 		})
 	}
 	return services
@@ -479,7 +487,7 @@ func deriveServiceName(projectRoot, relRoot string) string {
 }
 
 func serviceNameOrFallback(raw string) string {
-	if name := sanitizeName(raw); name != "" {
+	if name := NormalizeName(raw); name != "" {
 		return name
 	}
 	return "service"
@@ -495,7 +503,7 @@ func looksLikeServiceDir(name string) bool {
 }
 
 func uniqueName(name string, used map[string]int) string {
-	base := sanitizeName(name)
+	base := NormalizeName(name)
 	if base == "" {
 		base = "service"
 	}
@@ -507,7 +515,9 @@ func uniqueName(name string, used map[string]int) string {
 	return base + "-" + itoa(used[base])
 }
 
-func sanitizeName(name string) string {
+// NormalizeName converts an arbitrary project or service name into one ASCII
+// DNS label. It is the canonical name normalizer used by discovery and plans.
+func NormalizeName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.ReplaceAll(name, "_", "-")
 

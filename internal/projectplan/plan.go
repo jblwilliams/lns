@@ -9,9 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
-	"unicode"
 
+	"lns/internal/devrun"
 	"lns/internal/discovery"
 	"lns/internal/models"
 	"lns/internal/projectconfig"
@@ -29,35 +30,49 @@ const (
 type PortStrategy string
 
 const (
-	PortDynamic PortStrategy = "dynamic"
-	PortFixed   PortStrategy = "fixed"
+	PortDynamic    PortStrategy = "dynamic"
+	PortFixed      PortStrategy = "fixed"
+	PortUnresolved PortStrategy = "unresolved"
 )
 
+type ServiceState string
+
+const (
+	StateManaged    ServiceState = "managed"
+	StateExternal   ServiceState = "external"
+	StateUnresolved ServiceState = "unresolved"
+)
+
+type Route struct {
+	Scheme string
+	Port   int
+}
+
 type Plan struct {
-	SchemaVersion int          `json:"schema_version"`
-	Project       Project      `json:"project"`
-	Services      []Service    `json:"services"`
-	Dependencies  []Dependency `json:"dependencies"`
-	Warnings      []Warning    `json:"warnings"`
+	SchemaVersion int       `json:"schema_version"`
+	Project       Project   `json:"project"`
+	Services      []Service `json:"services"`
+	Warnings      []Warning `json:"warnings"`
 }
 
 type Project struct {
-	Name   string `json:"name"`
-	Root   string `json:"root"`
-	Source Source `json:"source"`
+	Name     string `json:"name"`
+	Root     string `json:"root"`
+	Source   Source `json:"source"`
+	Worktree string `json:"worktree,omitempty"`
 }
 
 type Service struct {
-	Name        string            `json:"name"`
-	Root        string            `json:"root"`
-	Script      string            `json:"script,omitempty"`
-	Command     []string          `json:"command,omitempty"`
-	Profile     models.Profile    `json:"profile"`
-	Hostname    string            `json:"hostname"`
-	URL         string            `json:"url"`
-	Port        Port              `json:"port"`
-	Environment map[string]string `json:"environment,omitempty"`
-	Evidence    []string          `json:"evidence"`
+	Name     string         `json:"name"`
+	Root     string         `json:"root"`
+	Script   string         `json:"script,omitempty"`
+	Command  []string       `json:"command,omitempty"`
+	Profile  models.Profile `json:"profile"`
+	State    ServiceState   `json:"state"`
+	Hostname string         `json:"hostname"`
+	URL      string         `json:"url"`
+	Port     Port           `json:"port"`
+	Evidence []string       `json:"evidence"`
 }
 
 type Port struct {
@@ -71,11 +86,6 @@ type ObservedPort struct {
 	Evidence string `json:"evidence"`
 }
 
-type Dependency struct {
-	Name string `json:"name"`
-	Kind string `json:"kind"`
-}
-
 type Warning struct {
 	Code     string `json:"code"`
 	Message  string `json:"message"`
@@ -84,7 +94,7 @@ type Warning struct {
 
 // Build returns a deterministic symbolic plan for root. An explicit lns.json
 // is an override; without one, the plan is discovered entirely in memory.
-func Build(root string) (Plan, error) {
+func Build(root string, route Route) (Plan, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return Plan{}, fmt.Errorf("resolve project root: %w", err)
@@ -96,14 +106,21 @@ func Build(root string) (Plan, error) {
 	if !info.IsDir() {
 		return Plan{}, fmt.Errorf("project root is not a directory: %s", absRoot)
 	}
+	route, err = route.normalized()
+	if err != nil {
+		return Plan{}, err
+	}
 
-	name := discoveredProjectName(absRoot)
+	name := ProjectName(absRoot)
 	source := SourceDiscovered
 	var compiled models.Project
-	var detectedEvidence map[string][]string
+	type evidence struct {
+		all  []string
+		port string
+	}
+	var evidenceByService map[string]evidence
 	if projectconfig.Exists(absRoot) {
-		cfg, loadErr := projectconfig.Load(absRoot)
-		err = loadErr
+		cfg, err := projectconfig.Load(absRoot)
 		if err != nil {
 			return Plan{}, fmt.Errorf("load %s: %w", projectconfig.Filename, err)
 		}
@@ -115,13 +132,16 @@ func Build(root string) (Plan, error) {
 		compiled = cfg.ToProject(absRoot)
 	} else {
 		detected := discovery.DetectServices(absRoot)
-		detectedEvidence = make(map[string][]string, len(detected))
+		evidenceByService = make(map[string]evidence, len(detected))
 		compiled = models.Project{Name: name, Path: absRoot, Services: make([]models.Service, 0, len(detected))}
 		for _, service := range detected {
 			if len(detected) == 1 && service.Root == "." {
 				service.Name = name
 			}
-			detectedEvidence[service.Name] = append([]string(nil), service.Evidence...)
+			evidenceByService[service.Name] = evidence{
+				all:  append([]string(nil), service.Evidence...),
+				port: service.PortEvidence,
+			}
 			compiled.Services = append(compiled.Services, models.Service{
 				Name:    service.Name,
 				Root:    service.Root,
@@ -137,61 +157,84 @@ func Build(root string) (Plan, error) {
 	plan := Plan{
 		SchemaVersion: SchemaVersion,
 		Project: Project{
-			Name:   name,
-			Root:   absRoot,
-			Source: source,
+			Name:     name,
+			Root:     absRoot,
+			Source:   source,
+			Worktree: devrun.DetectWorktreePrefix(absRoot),
 		},
-		Services:     []Service{},
-		Dependencies: []Dependency{},
-		Warnings:     []Warning{},
+		Services: []Service{},
+		Warnings: []Warning{},
 	}
 	for _, service := range compiled.Services {
-		hostname := compiled.GetServiceHostname(service)
-		evidence := detectedEvidence[service.Name]
+		hostname := devrun.ApplyWorktreePrefix(compiled.GetServiceHostname(service), plan.Project.Worktree)
+		serviceEvidence := evidenceByService[service.Name]
 		if source == SourceConfig {
-			evidence = []string{projectconfig.Filename}
+			serviceEvidence = evidence{all: []string{projectconfig.Filename}, port: projectconfig.Filename}
 		}
-		evidence = stableStrings(evidence)
+		serviceEvidence.all = stableStrings(serviceEvidence.all)
+		state := serviceState(service)
 		port := Port{Strategy: PortDynamic}
 		if service.Port > 0 {
-			port.Observed = []ObservedPort{{Value: service.Port, Evidence: firstEvidence(evidence)}}
+			port.Observed = []ObservedPort{{Value: service.Port, Evidence: serviceEvidence.port}}
 		}
-		if !service.CanRun() && service.Port > 0 {
+		switch state {
+		case StateManaged:
+		case StateExternal:
 			port.Strategy = PortFixed
 			port.Fixed = service.Port
+		case StateUnresolved:
+			port.Strategy = PortUnresolved
+		default:
+			panic(fmt.Sprintf("unhandled service state %q", state))
 		}
 		plan.Services = append(plan.Services, Service{
-			Name:        service.Name,
-			Root:        service.Root,
-			Script:      service.Script,
-			Command:     append([]string(nil), service.Command...),
-			Profile:     service.EffectiveProfile(),
-			Hostname:    hostname,
-			URL:         "http://" + hostname,
-			Port:        port,
-			Environment: map[string]string{},
-			Evidence:    evidence,
+			Name:     service.Name,
+			Root:     service.Root,
+			Script:   service.Script,
+			Command:  append([]string(nil), service.Command...),
+			Profile:  service.EffectiveProfile(),
+			State:    state,
+			Hostname: hostname,
+			URL:      route.url(hostname),
+			Port:     port,
+			Evidence: serviceEvidence.all,
 		})
+		if state == StateUnresolved {
+			recovery := "run `lns init`, then resolve the service explicitly"
+			if source == SourceConfig {
+				recovery = "edit lns.json and set a valid profile plus script, command, or port"
+			}
+			plan.Warnings = append(plan.Warnings, Warning{
+				Code:     "unresolved-service",
+				Message:  fmt.Sprintf("service %q is unresolved and will not run", service.Name),
+				Recovery: recovery,
+			})
+		}
 	}
 
 	sort.Slice(plan.Services, func(i, j int) bool { return plan.Services[i].Name < plan.Services[j].Name })
-	runnable := 0
-	for _, service := range plan.Services {
-		if service.Script != "" || len(service.Command) > 0 {
-			runnable++
-		}
-	}
-	if runnable == 0 {
+	if len(plan.Services) == 0 {
 		plan.Warnings = append(plan.Warnings, Warning{
 			Code:     "no-services",
 			Message:  "no runnable HTTP services were discovered",
 			Recovery: "run `lns init`, then describe the service explicitly",
 		})
 	}
+	sort.Slice(plan.Warnings, func(i, j int) bool {
+		if plan.Warnings[i].Code == plan.Warnings[j].Code {
+			return plan.Warnings[i].Message < plan.Warnings[j].Message
+		}
+		return plan.Warnings[i].Code < plan.Warnings[j].Code
+	})
 	return plan, nil
 }
 
-func discoveredProjectName(root string) string {
+// ProjectName returns the canonical discovered project identity used by plan,
+// init, and the bare run path.
+func ProjectName(root string) string {
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
 	data, err := os.ReadFile(filepath.Join(root, "package.json"))
 	if err == nil {
 		var pkg struct {
@@ -199,31 +242,15 @@ func discoveredProjectName(root string) string {
 			Private bool   `json:"private"`
 		}
 		if json.Unmarshal(data, &pkg) == nil && pkg.Private {
-			if name := dnsLabel(pkg.Name); name != "" {
+			if name := discovery.NormalizeName(pkg.Name); name != "" {
 				return name
 			}
 		}
 	}
-	if name := dnsLabel(filepath.Base(root)); name != "" {
+	if name := discovery.NormalizeName(filepath.Base(root)); name != "" {
 		return name
 	}
 	return "project"
-}
-
-func dnsLabel(value string) string {
-	value = strings.TrimSpace(strings.TrimPrefix(value, "@"))
-	var out strings.Builder
-	dash := false
-	for _, r := range strings.ToLower(value) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			out.WriteRune(r)
-			dash = false
-		} else if out.Len() > 0 && !dash {
-			out.WriteByte('-')
-			dash = true
-		}
-	}
-	return strings.Trim(out.String(), "-")
 }
 
 func stableStrings(values []string) []string {
@@ -241,17 +268,42 @@ func stableStrings(values []string) []string {
 	return result
 }
 
-func firstEvidence(evidence []string) string {
-	if len(evidence) == 0 {
-		return "observed project configuration"
-	}
-	return evidence[0]
-}
-
 func joinValidationErrors(errs []projectconfig.ValidationError) string {
 	messages := make([]string, len(errs))
 	for i, err := range errs {
 		messages[i] = err.Error()
 	}
 	return strings.Join(messages, "; ")
+}
+
+func serviceState(service models.Service) ServiceState {
+	if !service.IsResolved() {
+		return StateUnresolved
+	}
+	if service.CanRun() {
+		return StateManaged
+	}
+	return StateExternal
+}
+
+func (route Route) normalized() (Route, error) {
+	route.Scheme = strings.ToLower(strings.TrimSpace(route.Scheme))
+	if route.Scheme != "http" && route.Scheme != "https" {
+		return Route{}, fmt.Errorf("proxy scheme must be http or https")
+	}
+	if route.Port < 1 || route.Port > 65535 {
+		return Route{}, fmt.Errorf("proxy port must be between 1 and 65535")
+	}
+	return route, nil
+}
+
+func (route Route) url(hostname string) string {
+	defaultPort := 80
+	if route.Scheme == "https" {
+		defaultPort = 443
+	}
+	if route.Port == defaultPort {
+		return route.Scheme + "://" + hostname
+	}
+	return route.Scheme + "://" + hostname + ":" + strconv.Itoa(route.Port)
 }

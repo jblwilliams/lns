@@ -25,7 +25,12 @@ processes, prune leases, or reload the proxy.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		root, _ := cmd.Flags().GetString("path")
 		jsonOutput, _ := cmd.Flags().GetBool("json")
-		return runPlan(cmd.OutOrStdout(), root, jsonOutput)
+		settings := loadSettingsOrDefault()
+		scheme := "http"
+		if settings.HTTPS {
+			scheme = "https"
+		}
+		return runPlan(cmd.OutOrStdout(), root, jsonOutput, projectplan.Route{Scheme: scheme, Port: settings.HTTPPort})
 	},
 }
 
@@ -35,8 +40,8 @@ func init() {
 	planCmd.Flags().Bool("json", false, "Write the plan as JSON with no surrounding text")
 }
 
-func runPlan(output io.Writer, root string, jsonOutput bool) error {
-	plan, err := projectplan.Build(root)
+func runPlan(output io.Writer, root string, jsonOutput bool, route projectplan.Route) error {
+	plan, err := projectplan.Build(root, route)
 	if err != nil {
 		return err
 	}
@@ -54,7 +59,7 @@ func writePlan(output io.Writer, plan projectplan.Plan, jsonOutput bool) error {
 		return err
 	}
 	writer := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(writer, "SERVICE\tCOMMAND\tLOCAL NAME\tPORT"); err != nil {
+	if _, err := fmt.Fprintln(writer, "SERVICE\tSTATE\tCOMMAND\tLOCAL NAME\tPORT"); err != nil {
 		return err
 	}
 	for _, service := range plan.Services {
@@ -66,7 +71,7 @@ func writePlan(output io.Writer, plan projectplan.Plan, jsonOutput bool) error {
 		if service.Port.Strategy == projectplan.PortFixed {
 			port = fmt.Sprintf("%d", service.Port.Fixed)
 		}
-		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", service.Name, command, service.URL, port); err != nil {
+		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", service.Name, service.State, command, service.URL, port); err != nil {
 			return err
 		}
 	}

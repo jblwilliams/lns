@@ -47,7 +47,7 @@ func TestRunPlanDoesNotWriteProjectConfig(t *testing.T) {
 	}
 	var output bytes.Buffer
 
-	if err := runPlan(&output, root, false); err != nil {
+	if err := runPlan(&output, root, false, projectplan.Route{Scheme: "http", Port: 80}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -56,5 +56,27 @@ func TestRunPlanDoesNotWriteProjectConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "lns.json")); !os.IsNotExist(err) {
 		t.Fatalf("lns plan wrote repository config: %v", err)
+	}
+}
+
+func TestWritePlanRendersWarningAndRecovery(t *testing.T) {
+	plan := projectplan.Plan{
+		SchemaVersion: 1,
+		Project:       projectplan.Project{Name: "demo", Root: "/repo", Source: projectplan.SourceDiscovered},
+		Warnings: []projectplan.Warning{{
+			Code:     "no-services",
+			Message:  "no runnable HTTP services were discovered",
+			Recovery: "run `lns init`, then describe the service explicitly",
+		}},
+	}
+	var output bytes.Buffer
+
+	if err := writePlan(&output, plan, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(output.String(), "warning: no runnable HTTP services were discovered") ||
+		!strings.Contains(output.String(), "next: run `lns init`, then describe the service explicitly") {
+		t.Fatalf("warning output is incomplete:\n%s", output.String())
 	}
 }

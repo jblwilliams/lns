@@ -18,6 +18,7 @@ import (
 	"lns/internal/discovery"
 	"lns/internal/models"
 	"lns/internal/projectconfig"
+	"lns/internal/projectplan"
 	"lns/internal/registry"
 )
 
@@ -103,7 +104,7 @@ var initCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		projectName := filepath.Base(root)
+		projectName := projectplan.ProjectName(root)
 		if len(args) == 1 {
 			projectName = strings.TrimSpace(args[0])
 		}
