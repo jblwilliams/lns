@@ -9,6 +9,7 @@ import (
 
 	"lns/internal/config"
 	"lns/internal/models"
+	"lns/internal/state"
 )
 
 type Manager struct {
@@ -44,6 +45,12 @@ func Load() (*models.Registry, error) {
 }
 
 func (m *Manager) Save() error {
+	return state.WithGlobalLock(func() error {
+		return m.saveUnlocked()
+	})
+}
+
+func (m *Manager) saveUnlocked() error {
 	if err := config.EnsureConfigDirs(); err != nil {
 		return err
 	}
@@ -55,7 +62,7 @@ func (m *Manager) Save() error {
 		return err
 	}
 
-	return os.WriteFile(config.GetRegistryPath(), append(data, '\n'), 0644)
+	return state.WriteFileAtomic(config.GetRegistryPath(), append(data, '\n'), 0644)
 }
 
 func (m *Manager) GetProject(name string) (*models.Project, bool) {
@@ -91,13 +98,19 @@ func (m *Manager) GetAllPortAssignments() map[int]string {
 }
 
 func (m *Manager) RemoveProject(name string) error {
-	if _, exists := m.Registry.Projects[name]; !exists {
-		return fmt.Errorf("project %q not found", name)
-	}
-
-	delete(m.Registry.Projects, name)
-	rebuildAssignments(m.Registry)
-	return m.Save()
+	return state.WithGlobalLock(func() error {
+		fresh, err := Load()
+		if err != nil {
+			return err
+		}
+		m.Registry = fresh
+		if _, exists := m.Registry.Projects[name]; !exists {
+			return fmt.Errorf("project %q not found", name)
+		}
+		delete(m.Registry.Projects, name)
+		rebuildAssignments(m.Registry)
+		return m.saveUnlocked()
+	})
 }
 
 func (m *Manager) UpsertProject(project models.Project) error {
@@ -105,10 +118,20 @@ func (m *Manager) UpsertProject(project models.Project) error {
 		return fmt.Errorf("project name is required")
 	}
 
-	normalizeProject(&project)
-	m.Registry.Projects[project.Name] = project
-	rebuildAssignments(m.Registry)
-	return m.Save()
+	return state.WithGlobalLock(func() error {
+		fresh, err := Load()
+		if err != nil {
+			return err
+		}
+		m.Registry = fresh
+		if errs := m.ValidateProjectConflicts(project); len(errs) > 0 {
+			return fmt.Errorf("project conflicts: %v", errs)
+		}
+		normalizeProject(&project)
+		m.Registry.Projects[project.Name] = project
+		rebuildAssignments(m.Registry)
+		return m.saveUnlocked()
+	})
 }
 
 func (m *Manager) ValidateProjectConflicts(project models.Project) []error {
@@ -127,13 +150,15 @@ func (m *Manager) ValidateProjectConflicts(project models.Project) []error {
 			continue
 		}
 
-		if owner := seenPorts[service.Port]; owner != "" {
-			errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
-		} else {
-			seenPorts[service.Port] = project.Name + ":" + service.Name
-		}
-		if owner := snapshot.PortAssignments[service.Port]; owner != "" {
-			errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
+		if service.Port > 0 {
+			if owner := seenPorts[service.Port]; owner != "" {
+				errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
+			} else {
+				seenPorts[service.Port] = project.Name + ":" + service.Name
+			}
+			if owner := snapshot.PortAssignments[service.Port]; owner != "" {
+				errs = append(errs, fmt.Errorf("port %d is already owned by %s", service.Port, owner))
+			}
 		}
 
 		hostname := strings.ToLower(project.GetServiceHostname(service))
@@ -232,7 +257,9 @@ func rebuildAssignments(reg *models.Registry) {
 				continue
 			}
 
-			reg.PortAssignments[service.Port] = projectName + ":" + service.Name
+			if service.Port > 0 {
+				reg.PortAssignments[service.Port] = projectName + ":" + service.Name
+			}
 			reg.HostnameAssignments[strings.ToLower(project.GetServiceHostname(service))] = projectName + ":" + service.Name
 		}
 	}

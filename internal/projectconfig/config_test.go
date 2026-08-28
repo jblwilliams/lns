@@ -28,6 +28,31 @@ func TestValidateAcceptsResolvedAndUnresolvedServices(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsRunnableServiceWithoutFixedDevelopmentPort(t *testing.T) {
+	cfg := &Config{
+		Name: "demo",
+		Services: map[string]Service{
+			"frontend": {
+				Root:          ".",
+				Profile:       models.ProfileHMR,
+				Status:        models.StatusResolved,
+				Script:        "dev",
+				ContainerPort: 5173,
+			},
+		},
+	}
+
+	if errs := Validate(cfg); len(errs) != 0 {
+		t.Fatalf("expected runnable service to be valid without a fixed port, got %v", errs)
+	}
+
+	project := cfg.ToProject("/repo")
+	service := project.Services[0]
+	if service.Script != "dev" || service.ContainerPort != 5173 {
+		t.Fatalf("expected run and deployment metadata to survive compilation, got %#v", service)
+	}
+}
+
 func TestValidateRejectsInvalidResolvedService(t *testing.T) {
 	cfg := &Config{
 		Name: "demo",

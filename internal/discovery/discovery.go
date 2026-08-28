@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ type DetectedService struct {
 	Name     string
 	Root     string
 	Port     int
+	Script   string
 	Profile  models.Profile
 	Status   models.ServiceStatus
 	Source   models.ServiceSource
@@ -48,18 +50,23 @@ func BootstrapConfig(projectName, projectRoot, prefix string) *projectconfig.Con
 	detected := DetectServices(projectRoot)
 	if len(detected) == 0 {
 		detected = []DetectedService{{
-			Name:     "app",
+			Name:     serviceNameOrFallback(projectName),
 			Root:     ".",
 			Status:   models.StatusUnresolved,
 			Source:   models.SourceDetected,
 			Evidence: []string{"no services detected from common repo signals"},
 		}}
+	} else if len(detected) == 1 && detected[0].Root == "." {
+		if name := sanitizeName(projectName); name != "" {
+			detected[0].Name = name
+		}
 	}
 
 	for _, service := range detected {
 		cfg.Services[service.Name] = projectconfig.Service{
 			Root:    service.Root,
 			Port:    service.Port,
+			Script:  service.Script,
 			Profile: service.Profile,
 			Source:  service.Source,
 			Status:  service.Status,
@@ -81,9 +88,17 @@ func DetectServices(projectRoot string) []DetectedService {
 			continue
 		}
 
+		siblings := detectSiblingScriptServices(projectRoot, root, service.Script)
+		if root == "." && service.Profile == models.ProfileHMR && len(siblings) > 0 {
+			service.Name = "web"
+		}
 		name := uniqueName(service.Name, usedNames)
 		service.Name = name
 		services = append(services, service)
+		for _, sibling := range siblings {
+			sibling.Name = uniqueName(sibling.Name, usedNames)
+			services = append(services, sibling)
+		}
 	}
 
 	sort.Slice(services, func(i, j int) bool {
@@ -171,6 +186,18 @@ func discoverCandidateRoots(projectRoot string) []string {
 		}
 	}
 
+	for _, pattern := range workspacePatterns(projectRoot) {
+		matches, err := filepath.Glob(filepath.Join(projectRoot, filepath.FromSlash(pattern)))
+		if err != nil {
+			continue
+		}
+		for _, match := range matches {
+			if rel, err := filepath.Rel(projectRoot, match); err == nil {
+				add(rel)
+			}
+		}
+	}
+
 	entries, err := os.ReadDir(projectRoot)
 	if err == nil {
 		for _, entry := range entries {
@@ -190,8 +217,9 @@ func inspectRoot(projectRoot, relRoot string) (DetectedService, bool) {
 
 	profile, profileSource := detectProfile(absRoot)
 	port, portSource := detectPort(absRoot)
+	script, scriptSource := detectScript(absRoot)
 
-	if profile == "" && port == 0 {
+	if profile == "" && port == 0 && script == "" {
 		return DetectedService{}, false
 	}
 
@@ -202,21 +230,83 @@ func inspectRoot(projectRoot, relRoot string) (DetectedService, bool) {
 	if portSource != "" {
 		evidence = append(evidence, portSource)
 	}
+	if scriptSource != "" {
+		evidence = append(evidence, scriptSource)
+	}
 
 	status := models.StatusUnresolved
-	if profile != "" && port > 0 {
+	if profile != "" && (port > 0 || script != "") {
 		status = models.StatusResolved
 	}
 
 	return DetectedService{
-		Name:     deriveServiceName(relRoot, profile),
+		Name:     deriveServiceName(projectRoot, relRoot),
 		Root:     relRoot,
 		Port:     port,
+		Script:   script,
 		Profile:  profile,
 		Status:   status,
 		Source:   models.SourceDetected,
 		Evidence: evidence,
 	}, true
+}
+
+func detectScript(root string) (string, string) {
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return "", ""
+	}
+
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if json.Unmarshal(data, &pkg) != nil || strings.TrimSpace(pkg.Scripts["dev"]) == "" {
+		return "", ""
+	}
+	return "dev", "package.json script dev"
+}
+
+func detectSiblingScriptServices(projectRoot, relRoot, primaryScript string) []DetectedService {
+	data, err := os.ReadFile(filepath.Join(projectRoot, relRoot, "package.json"))
+	if err != nil {
+		return nil
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if json.Unmarshal(data, &pkg) != nil {
+		return nil
+	}
+
+	candidates := []struct {
+		script string
+		name   string
+	}{
+		{script: "server", name: "server"},
+		{script: "api", name: "api"},
+		{script: "dev:server", name: "server"},
+		{script: "dev:api", name: "api"},
+	}
+	seen := map[string]bool{}
+	var services []DetectedService
+	for _, candidate := range candidates {
+		command := strings.TrimSpace(pkg.Scripts[candidate.script])
+		if command == "" || candidate.script == primaryScript || seen[candidate.name] {
+			continue
+		}
+		seen[candidate.name] = true
+		services = append(services, DetectedService{
+			Name:     candidate.name,
+			Root:     cleanRoot(relRoot),
+			Port:     findPort(command),
+			Script:   candidate.script,
+			Profile:  models.ProfileStandard,
+			Status:   models.StatusResolved,
+			Source:   models.SourceDetected,
+			Evidence: []string{"package.json script " + candidate.script},
+		})
+	}
+	return services
 }
 
 func detectProfile(root string) (models.Profile, string) {
@@ -238,7 +328,10 @@ func detectProfile(root string) (models.Profile, string) {
 			strings.Contains(lower, `"@vue/cli-service"`),
 			strings.Contains(lower, `"vue-cli-service"`):
 			return models.ProfileHMR, "package.json"
-		case strings.Contains(lower, `"express"`):
+		case strings.Contains(lower, `"express"`),
+			strings.Contains(lower, `"hono"`),
+			strings.Contains(lower, `"fastify"`),
+			strings.Contains(lower, `"koa"`):
 			return models.ProfileStandard, "package.json"
 		}
 	}
@@ -265,6 +358,69 @@ func detectProfile(root string) (models.Profile, string) {
 	}
 
 	return "", ""
+}
+
+func workspacePatterns(root string) []string {
+	var patterns []string
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err == nil {
+		var pkg struct {
+			Workspaces json.RawMessage `json:"workspaces"`
+		}
+		if json.Unmarshal(data, &pkg) == nil && len(pkg.Workspaces) > 0 {
+			var declared []string
+			if json.Unmarshal(pkg.Workspaces, &declared) == nil {
+				patterns = append(patterns, declared...)
+			} else {
+				var object struct {
+					Packages []string `json:"packages"`
+				}
+				if json.Unmarshal(pkg.Workspaces, &object) == nil {
+					patterns = append(patterns, object.Packages...)
+				}
+			}
+		}
+	}
+	patterns = append(patterns, pnpmWorkspacePatterns(filepath.Join(root, "pnpm-workspace.yaml"))...)
+
+	seen := map[string]bool{}
+	result := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		pattern = strings.Trim(strings.TrimSpace(pattern), `"'`)
+		if pattern == "" || strings.HasPrefix(pattern, "!") || seen[pattern] {
+			continue
+		}
+		seen[pattern] = true
+		result = append(result, pattern)
+	}
+	return result
+}
+
+func pnpmWorkspacePatterns(path string) []string {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	inPackages := false
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			inPackages = trimmed == "packages:"
+			continue
+		}
+		if inPackages && strings.HasPrefix(trimmed, "-") {
+			patterns = append(patterns, strings.TrimSpace(strings.TrimPrefix(trimmed, "-")))
+		}
+	}
+	return patterns
 }
 
 func detectPort(root string) (int, string) {
@@ -315,30 +471,18 @@ func findPort(text string) int {
 	return 0
 }
 
-func deriveServiceName(relRoot string, profile models.Profile) string {
+func deriveServiceName(projectRoot, relRoot string) string {
 	if relRoot == "." {
-		if profile == models.ProfileHMR {
-			return "web"
-		}
-		return "app"
+		return serviceNameOrFallback(filepath.Base(projectRoot))
 	}
+	return serviceNameOrFallback(filepath.Base(relRoot))
+}
 
-	base := strings.ToLower(filepath.Base(relRoot))
-	switch base {
-	case "web", "www", "client", "frontend":
-		return "web"
-	case "backend", "server":
-		return "api"
+func serviceNameOrFallback(raw string) string {
+	if name := sanitizeName(raw); name != "" {
+		return name
 	}
-
-	name := sanitizeName(base)
-	if name == "" {
-		if profile == models.ProfileHMR {
-			return "web"
-		}
-		return "app"
-	}
-	return name
+	return "service"
 }
 
 func looksLikeServiceDir(name string) bool {

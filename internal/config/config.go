@@ -26,6 +26,14 @@ func GetGlobalCaddyfilePath() string {
 	return filepath.Join(GetConfigDir(), "Caddyfile")
 }
 
+func GetRuntimePath() string {
+	return filepath.Join(GetConfigDir(), "runtime.json")
+}
+
+func GetRuntimeCaddyfilePath() string {
+	return filepath.Join(GetCaddyConfigDir(), "00-runtime.caddy")
+}
+
 func EnsureConfigDirs() error {
 	dirs := []string{
 		GetConfigDir(),

@@ -35,6 +35,9 @@ type Service struct {
 	Name          string        `json:"name"`
 	Root          string        `json:"root,omitempty"`
 	Port          int           `json:"port,omitempty"`
+	ContainerPort int           `json:"container_port,omitempty"`
+	Script        string        `json:"script,omitempty"`
+	Command       []string      `json:"command,omitempty"`
 	Profile       Profile       `json:"profile,omitempty"`
 	Hostname      string        `json:"hostname,omitempty"`
 	Source        ServiceSource `json:"source,omitempty"`
@@ -61,7 +64,7 @@ func (s Service) EffectiveStatus() ServiceStatus {
 	if s.Status != "" {
 		return s.Status
 	}
-	if s.Root != "" && s.Port > 0 && s.Profile != "" {
+	if s.Root != "" && (s.Port > 0 || s.CanRun()) && s.Profile != "" {
 		return StatusResolved
 	}
 	return StatusUnresolved
@@ -83,10 +86,22 @@ func (s *Service) GetUpstream() string {
 }
 
 func (s *Service) GetDockerUpstream() string {
+	port := s.DeploymentPort()
 	if s.Docker && s.ContainerName != "" {
-		return s.ContainerName + ":" + strconv.Itoa(s.Port)
+		return s.ContainerName + ":" + strconv.Itoa(port)
 	}
-	return s.GetUpstream()
+	return "localhost:" + strconv.Itoa(port)
+}
+
+func (s Service) DeploymentPort() int {
+	if s.ContainerPort > 0 {
+		return s.ContainerPort
+	}
+	return s.Port
+}
+
+func (s Service) CanRun() bool {
+	return s.Script != "" || len(s.Command) > 0
 }
 
 type Project struct {

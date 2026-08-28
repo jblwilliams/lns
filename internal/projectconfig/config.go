@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"lns/internal/models"
+	"lns/internal/state"
 )
 
 const Filename = "lns.json"
@@ -23,6 +24,9 @@ type Config struct {
 type Service struct {
 	Root          string               `json:"root,omitempty"`
 	Port          int                  `json:"port,omitempty"`
+	ContainerPort int                  `json:"container_port,omitempty"`
+	Script        string               `json:"script,omitempty"`
+	Command       []string             `json:"command,omitempty"`
 	Profile       models.Profile       `json:"profile,omitempty"`
 	Hostname      string               `json:"hostname,omitempty"`
 	Source        models.ServiceSource `json:"source,omitempty"`
@@ -84,7 +88,7 @@ func Save(root string, cfg *Config) error {
 		return err
 	}
 
-	return os.WriteFile(Path(root), append(data, '\n'), 0644)
+	return state.WriteFileAtomic(Path(root), append(data, '\n'), 0644)
 }
 
 func (c *Config) Normalize() {
@@ -102,11 +106,19 @@ func (c *Config) Normalize() {
 		}
 
 		service.Root = cleanRoot(service.Root)
+		service.Script = strings.TrimSpace(service.Script)
+		command := make([]string, 0, len(service.Command))
+		for _, arg := range service.Command {
+			if arg = strings.TrimSpace(arg); arg != "" {
+				command = append(command, arg)
+			}
+		}
+		service.Command = command
 		if service.Source == "" {
 			service.Source = models.SourceConfig
 		}
 		if service.Status == "" {
-			if service.Root != "" && service.Port > 0 && service.Profile != "" {
+			if service.Root != "" && (service.Port > 0 || service.Script != "" || len(service.Command) > 0) && service.Profile != "" {
 				service.Status = models.StatusResolved
 			} else {
 				service.Status = models.StatusUnresolved
@@ -141,6 +153,9 @@ func (c *Config) ToProject(root string) models.Project {
 			Name:          name,
 			Root:          service.Root,
 			Port:          service.Port,
+			ContainerPort: service.ContainerPort,
+			Script:        service.Script,
+			Command:       append([]string(nil), service.Command...),
 			Profile:       service.Profile,
 			Hostname:      service.Hostname,
 			Source:        service.Source,
@@ -183,8 +198,16 @@ func Validate(cfg *Config) []ValidationError {
 			if service.Root == "" {
 				errs = append(errs, ValidationError{Service: name, Field: "root", Message: "is required"})
 			}
-			if service.Port < 1 || service.Port > 65535 {
+			if service.Port == 0 && service.Script == "" && len(service.Command) == 0 {
+				errs = append(errs, ValidationError{Service: name, Field: "port", Message: "is required unless script or command can start the service dynamically"})
+			} else if service.Port < 0 || service.Port > 65535 {
 				errs = append(errs, ValidationError{Service: name, Field: "port", Message: "must be between 1 and 65535"})
+			}
+			if service.ContainerPort < 0 || service.ContainerPort > 65535 {
+				errs = append(errs, ValidationError{Service: name, Field: "container_port", Message: "must be between 1 and 65535"})
+			}
+			if service.Script != "" && len(service.Command) > 0 {
+				errs = append(errs, ValidationError{Service: name, Field: "command", Message: "cannot be combined with script"})
 			}
 			if !isValidProfile(service.Profile) {
 				errs = append(errs, ValidationError{Service: name, Field: "profile", Message: "must be one of hmr or standard"})

@@ -1,89 +1,65 @@
 # lns
 
-`lns` is a repo-first local reverse proxy manager for Caddy.
+`lns` gives local HTTP services stable HTTPS names without making you coordinate development ports.
 
-Each repo keeps its canonical service definition in `lns.json`. `lns sync` validates that file and compiles it into the global registry and generated Caddy config. No silent `generic` fallback. No opportunistic port reassignment.
-
-## Why
-
-Local development usually breaks down around ports:
-
-- multiple repos want `3000`
-- web and backend services drift from what the repo actually expects
-- Caddy or proxy config gets out of sync with the codebase
-- the real source of truth ends up buried in a global registry instead of the repo
-
-`lns` fixes that by making the repo own its service config and making sync explicit.
+Run `lns` in a repo. It discovers runnable services, leases free ports, starts or reloads Caddy, and runs the services at names such as `https://my-app.localhost`. The checked-in `lns.json` keeps names and deployment metadata stable; process-owned runtime leases keep local ports disposable.
 
 ## Installation
 
 ```bash
 go install ./cmd/lns
+brew install caddy # macOS
 ```
 
-You also need Caddy installed:
-
-```bash
-# macOS
-brew install caddy
-
-# Ubuntu / Debian
-sudo apt install caddy
-```
+On Ubuntu or Debian, install Caddy with `sudo apt install caddy`.
 
 ## Quick Start
 
 ```bash
-# 1. Bootstrap lns.json from the current repo
 cd ~/projects/my-app
-lns init
-
-# 2. Review lns.json
-#    If anything is unresolved, fill it in manually or add services explicitly
-lns service add api --root api --port 8000 --profile standard
-
-# 3. Compile repo config into registry + Caddy state
-lns sync
-
-# 4. Start the proxy
-lns start
-
-# 5. Reload Caddy after later syncs
-lns reload
+lns
 ```
 
-After sync, services are available at:
+The first run creates `lns.json` when needed. Bare `lns` runs every detected service with a runnable script or command.
+
+Run one service or override its command for one invocation:
+
+```bash
+lns run web
+lns run api -- pnpm run server
+```
+
+Services use stable public names:
 
 ```text
-single-service repo:  http://<prefix>.localhost:8888
-multi-service repo:   http://<prefix>-<service>.localhost:8888
+single-service repo:  https://<project>.localhost
+multi-service repo:   https://<project>-<service>.localhost
 ```
 
-If you configure the proxy HTTP port to `80`, the `:8888` suffix disappears.
+Local HTTPS uses Caddy's internal CA. The proxy defaults to port `443`; `8443` is the unprivileged fallback. Run `lns setup` to change it or `lns start --no-tls` when plain HTTP is specifically required.
 
-## Canonical Config
+## Configuration
 
-`lns.json` is the source of truth for a repo.
-
-Example:
+`lns.json` is the checked-in description of a repo. Development and deployment ports are deliberately separate:
 
 ```json
 {
   "name": "my-app",
-  "prefix": "my-app",
   "services": {
     "web": {
-      "root": ".",
-      "port": 5179,
+      "root": "web",
+      "script": "dev",
+      "container_port": 5173,
       "profile": "hmr",
-      "source": "detected",
       "status": "resolved"
     },
     "api": {
       "root": "api",
-      "port": 8000,
+      "command": ["uv", "run", "uvicorn", "app:app", "--port", "{port}"],
+      "container_port": 8000,
       "profile": "standard",
-      "source": "manual",
+      "docker": true,
+      "container_name": "api",
       "status": "resolved"
     }
   }
@@ -95,171 +71,129 @@ Required top-level fields:
 - `name`
 - `services`
 
-Required resolved service fields:
+A resolved service needs `root`, `profile`, and one way to run or route:
 
-- `root`
-- `port`
-- `profile`
+- `script`: a `package.json` script such as `dev`
+- `command`: an argument array; `{port}` becomes the leased development port
+- `port`: a fixed legacy/static host port
 
-Optional service fields:
+Optional deployment fields:
 
-- `hostname`
-- `source`
-- `status`
+- `container_port`: stable internal port used by Docker exports
 - `docker`
 - `container_name`
+- `hostname`
 
-Service profiles:
+`hmr` is appropriate for browser dev servers. `standard` is appropriate for APIs and other normal HTTP servers.
 
-- `hmr`: use proxy headers needed by HMR-style web dev servers
-- `standard`: use a normal reverse proxy block
-
-`lns init` may write unresolved stubs when detection is ambiguous. `lns sync` refuses to compile unresolved services.
-
-## Command Model
-
-Primary workflow:
+For manual setup:
 
 ```bash
 lns init
+lns service add api api --script dev --container-port 8000 --profile standard
 lns sync
-lns status
-lns reload
-lns start
-lns stop
-lns doctor
-lns service add <name> --port <port>
 ```
 
-Useful supporting commands:
+## Runtime Behavior
+
+`lns` chooses a free loopback port for each child process, registers a process-owned route, and removes it when the process exits. Dead owners are pruned after crashes.
+
+Each child receives:
+
+- `LNS_PORT`: its leased development port
+- `PORT` and `<SERVICE>_PORT` for normal HTTP servers
+- `VITE_PORT` for scripts that start Vite
+- `HOST=127.0.0.1`
+- `LNS_URL`: its public local URL
+- `LNS_<SERVICE>_URL`: the URL of every service in the project
+- `VITE_LNS_<SERVICE>_URL`: the same values exposed to Vite clients
+
+For example, a `web` service in a project with an `api` service receives `LNS_API_URL` and `VITE_LNS_API_URL`.
+
+Simple Vite, Next.js, and Nuxt scripts receive explicit loopback host and leased-port arguments, replacing fixed development flags when present. Compound scripts such as a dashboard that starts both an API and Vite receive `VITE_PORT`, leaving the API's private port alone. A service named `server` receives `SERVER_PORT`, which matches projects such as Peyra. Use `command` with `{port}` when a server needs a different custom argument or variable.
+
+## Worktrees
+
+Linked Git worktrees automatically receive a branch subdomain:
+
+```text
+main checkout:       https://my-app.localhost
+fix-auth worktree:   https://fix-auth.my-app.localhost
+```
+
+Every worktree receives independent runtime ports. The branch prefix and leased ports never modify `lns.json` or Docker metadata.
+
+## Workspaces and Detection
+
+`lns init` and first-run bootstrapping inspect:
+
+- `package.json` and `pnpm-workspace.yaml` workspaces
+- `dev` plus common sibling `server`/`api` scripts
+- Vite, Next.js, Nuxt, Vue, Hono, Express, Fastify, and Koa signals
+- `pyproject.toml`, `requirements.txt`, and common Python server files
+- `Gemfile`
+- `.env*` and common framework configuration files
+
+Packages with a `dev` script become runnable services when an HTTP profile can be identified. Ambiguous services remain unresolved until you add a profile, script, command, or fixed port.
+
+## Commands
 
 ```bash
-# Show the repo-local view if lns.json exists in the current directory
-lns status
-
-# Force the global registry view
-lns status --global
-
-# Check whether a canonical port is already owned
-lns check 5179
-
-# Export compiled Caddy config for a synced project
-lns export my-app -o Caddyfile
-
-# Show config paths
-lns config
-
-# Interactive proxy setup (proxy port + admin address)
-lns setup
+lns                              # bootstrap and run all services
+lns up                           # run all configured services
+lns run [service]                # run one service
+lns run [service] -- <command>   # one-time command override
+lns sync                         # validate and compile; auto-reload if running
+lns status                       # repo-local status
+lns status --global              # global registry
+lns start                        # start Caddy only
+lns stop                         # stop Caddy
+lns reload                       # manually reload Caddy
+lns doctor                       # diagnose local setup
+lns config                       # show state paths and proxy settings
 ```
 
-## Detection and Validation
+Use `lns run <service> --port <port>` when you intentionally need a fixed development port for one run.
 
-`lns init` and `lns status` inspect common repo signals:
+## Sync and State
 
-- `package.json`
-- `vite.config.*`
-- `next.config.*`
-- `nuxt.config.*`
-- `vue.config.js`
-- `pyproject.toml`
-- `requirements.txt`
-- `Gemfile`
-- `.env*`
+`lns sync` validates `lns.json`, rejects unresolved services and hostname conflicts, updates the global registry, and regenerates Caddyfiles. Fixed host ports still receive conflict checks; dynamically run services do not reserve port zero.
 
-Detection is used for:
+If Caddy is already running, sync reloads it automatically. Invalid changes do not silently pick a different checked-in port or mutate deployment metadata.
 
-- bootstrapping `lns.json`
-- choosing a default profile for `lns service add` when you omit `--profile`
-- reporting drift between repo config and detectable repo signals
+Global state lives under `~/.lns`:
 
-Detection is not used as steady-state routing truth after `lns.json` exists.
+- `registry.json`: compiled repo definitions
+- `runtime.json`: active process leases
+- `Caddyfile`: global generated configuration
+- `projects/*.caddy`: project and runtime routes
+- `settings.json`: HTTPS, proxy port, and Caddy admin settings
 
-## Sync Semantics
+Registry and runtime mutations use a shared lock and atomic file replacement so concurrent worktrees do not overwrite one another.
 
-`lns sync` is a read / validate / compile step.
+## Docker and Deployment Ports
 
-It:
-
-1. loads `lns.json`
-2. validates required fields
-3. blocks on unresolved services
-4. blocks on canonical port conflicts
-5. blocks on hostname conflicts
-6. updates the global registry
-7. regenerates the project and global Caddyfiles
-
-It does not:
-
-- mutate `lns.json`
-- silently reassign ports
-- silently choose a fallback framework or generic port range
-
-If repo signals disagree with `lns.json`, sync reports drift but still compiles from the canonical config.
-
-## Status Output
-
-Inside a repo with `lns.json`, `lns status` shows:
-
-- service status (`resolved` or `unresolved`)
-- source (`detected`, `manual`, or `config`)
-- root
-- port
-- profile
-- explicit hostname
-- drift against detectable repo signals
-
-Outside a repo, or with `--global`, `lns status` shows the compiled global registry view.
-
-## Caddy
-
-`lns` writes:
-
-- `~/.lns/registry.json`
-- `~/.lns/Caddyfile`
-- `~/.lns/projects/*.caddy`
-- `~/.lns/settings.json`
-
-The global Caddyfile imports project-level generated files. `lns start` and `lns reload` operate on that compiled state.
-
-## Docker Export
-
-Compiled projects can still be exported for Docker-based use:
+Development leases do not change Docker behavior. `lns run` uses a dynamic host port, while Docker exports use `container_port`, falling back to legacy `port` for older manifests.
 
 ```bash
 lns export my-app -o Caddyfile --upstream docker
 lns export my-app --docker-compose
 ```
 
-For Docker upstreams, service entries can include:
+Exports listen on port `80` by default, independent of the local HTTPS proxy setting. Use `--proxy-port` to choose a different deployment listener port.
 
-- `docker`
-- `container_name`
+This lets a Vite service use any free local port while its container continues to listen on `5173`, and lets an API lease any local port while staging and production continue to use container port `8000`.
+
+`lns` does not rewrite Compose files or dynamically change Postgres, Redis, or other non-HTTP backing-service ports. Keep those in Compose or environment-specific infrastructure configuration.
 
 ## Troubleshooting
 
-Service unresolved after `lns init`:
+If a service is unresolved, open `lns.json` and add a `script`, `command`, `port`, or missing `profile`, then run `lns` again.
 
-- open `lns.json`
-- fill in the missing `port` or `profile`
-- rerun `lns sync`
-
-Port conflict on `lns sync`:
-
-- run `lns check <port>`
-- inspect `lns status --global`
-- change the canonical repo port in `lns.json`
-
-Drift reported by `lns status` or `lns sync`:
-
-- either update the repo so it matches `lns.json`
-- or update `lns.json` and run `lns sync` again
-
-Caddy not running:
+If port `443` cannot be bound without extra setup, run `lns setup` and select `8443`. Check the whole setup with:
 
 ```bash
 lns doctor
-lns start
 ```
 
 ## Development

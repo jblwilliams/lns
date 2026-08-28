@@ -9,13 +9,15 @@ import (
 )
 
 const (
-	DefaultHTTPPort  = 8888
+	DefaultHTTPPort  = 443
+	FallbackHTTPPort = 8443
 	DefaultAdminAddr = "127.0.0.1:20190"
 )
 
 type Settings struct {
 	HTTPPort  int    `json:"http_port"`
 	AdminAddr string `json:"admin_addr"`
+	HTTPS     bool   `json:"https"`
 }
 
 func GetSettingsPath() string {
@@ -26,6 +28,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		HTTPPort:  DefaultHTTPPort,
 		AdminAddr: DefaultAdminAddr,
+		HTTPS:     true,
 	}
 }
 
@@ -40,7 +43,7 @@ func LoadSettings() (Settings, error) {
 		return Settings{}, err
 	}
 
-	var settings Settings
+	settings := DefaultSettings()
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return Settings{}, fmt.Errorf("decode %s: %w", path, err)
 	}
