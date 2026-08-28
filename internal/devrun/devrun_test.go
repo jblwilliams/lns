@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"lns/internal/models"
@@ -52,6 +53,32 @@ func TestApplyWorktreePrefixCreatesBranchSubdomain(t *testing.T) {
 func TestWorktreeLabelFallsBackToDirectoryForDetachedHead(t *testing.T) {
 	if got := worktreeLabel("", filepath.Join("tmp", "demo-fix-auth")); got != "demo-fix-auth" {
 		t.Fatalf("unexpected detached worktree label %q", got)
+	}
+}
+
+func TestOverlayEnvironmentReplacesDuplicatesExactlyOnce(t *testing.T) {
+	base := []string{"PATH=/bin", "PORT=3000", "PORT=3001", "HOME=/tmp/home"}
+
+	got := OverlayEnvironment(base, map[string]string{"PORT": "4300", "SERVER_PORT": "4301"})
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, item := range got {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			t.Fatalf("invalid environment entry %q", item)
+		}
+		counts[key]++
+		values[key] = value
+	}
+	if counts["PORT"] != 1 || values["PORT"] != "4300" {
+		t.Fatalf("expected one overlaid PORT, got %#v", got)
+	}
+	if counts["SERVER_PORT"] != 1 || values["SERVER_PORT"] != "4301" {
+		t.Fatalf("expected one SERVER_PORT, got %#v", got)
+	}
+	if values["PATH"] != "/bin" || values["HOME"] != "/tmp/home" {
+		t.Fatalf("base environment was not preserved: %#v", got)
 	}
 }
 

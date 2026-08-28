@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	DefaultHTTPPort  = 443
-	FallbackHTTPPort = 8443
+	DefaultHTTPPort  = 80
+	FallbackHTTPPort = 8888
 	DefaultAdminAddr = "127.0.0.1:20190"
 )
 
@@ -28,7 +28,7 @@ func DefaultSettings() Settings {
 	return Settings{
 		HTTPPort:  DefaultHTTPPort,
 		AdminAddr: DefaultAdminAddr,
-		HTTPS:     true,
+		HTTPS:     false,
 	}
 }
 

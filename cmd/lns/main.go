@@ -32,10 +32,10 @@ func main() {
 
 var rootCmd = &cobra.Command{
 	Use:   "lns",
-	Short: "Run local services at stable HTTPS names",
+	Short: "Run local services at stable local names",
 	Args:  cobra.NoArgs,
 	Long: `lns discovers or reads repo-local service configuration, leases dynamic
-development ports, and routes stable HTTPS names through Caddy.`,
+development ports, and routes stable local names through Caddy.`,
 	Example: `  lns
   lns plan
   lns run web`,
@@ -798,10 +798,6 @@ func showGlobalStatus() {
 
 func syncProject(root string, cfg *projectconfig.Config) error {
 	return syncProjectWithOutput(root, cfg, true)
-}
-
-func syncProjectForRun(root string, cfg *projectconfig.Config) error {
-	return syncProjectWithOutput(root, cfg, false)
 }
 
 func syncProjectWithOutput(root string, cfg *projectconfig.Config, verbose bool) error {

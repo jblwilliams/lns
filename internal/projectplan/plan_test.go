@@ -126,6 +126,16 @@ func TestBuildUsesRouteSettingsAndCanonicalScopedName(t *testing.T) {
 	}
 }
 
+func TestProjectNamePrefersComposeIdentity(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{"name":"peyra-proto","private":true}`)
+	mustWrite(t, filepath.Join(root, "docker-compose.yml"), "name: peyra\n\nservices: {}\n")
+
+	if got := ProjectName(root); got != "peyra" {
+		t.Fatalf("expected Compose identity, got %q", got)
+	}
+}
+
 func TestBuildSurfacesUnresolvedAndExternalServicesHonestly(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "lns.json"), `{
@@ -171,7 +181,7 @@ func TestBuildKeepsPortEvidenceAttachedToPortSource(t *testing.T) {
 	}
 
 	observed := plan.Services[0].Port.Observed
-	if len(observed) != 1 || observed[0].Value != 4173 || observed[0].Evidence != ".env" {
+	if len(observed) != 1 || observed[0].Value != 4173 || observed[0].Evidence != ".env:VITE_PORT" {
 		t.Fatalf("unexpected observed port provenance: %#v", observed)
 	}
 }
@@ -184,6 +194,94 @@ func TestBuildWarnsWhenNoServicesAreDiscovered(t *testing.T) {
 	if len(plan.Services) != 0 || len(plan.Warnings) != 1 || plan.Warnings[0].Code != "no-services" {
 		t.Fatalf("unexpected empty plan: %#v", plan)
 	}
+}
+
+func TestBuildInfersPeyraStylePortsAndLinks(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name": "peyra",
+  "private": true,
+  "scripts": {"dev": "vite", "server": "node server.js"},
+  "dependencies": {"express": "^5"},
+  "devDependencies": {"vite": "^7"}
+}`)
+	mustWrite(t, filepath.Join(root, ".env.example"), `CLIENT_PORT=5173
+SERVER_PORT=3001
+CORS_ORIGIN=http://localhost:5173
+VITE_API_URL=http://localhost:3001
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/peyra
+`)
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := serviceNamed(t, plan, "web")
+	server := serviceNamed(t, plan, "server")
+	assertObservedPort(t, web, 5173)
+	assertObservedPort(t, server, 3001)
+	assertBinding(t, web, "CLIENT_PORT", BindingPort, "web")
+	assertBinding(t, web, "SERVER_PORT", BindingPort, "server")
+	assertBinding(t, web, "VITE_API_URL", BindingURL, "server")
+	assertBinding(t, server, "CORS_ORIGIN", BindingURL, "web")
+	for _, service := range plan.Services {
+		for _, binding := range service.Environment {
+			if binding.Name == "DATABASE_URL" {
+				t.Fatal("database values must not be exposed as HTTP service links")
+			}
+		}
+	}
+}
+
+func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{"name":"momentum","private":true,"workspaces":["web","server-ts","desktop"]}`)
+	mustWrite(t, filepath.Join(root, "web", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
+	mustWrite(t, filepath.Join(root, "server-ts", "package.json"), `{"scripts":{"dev":"tsx watch src/index.ts"},"dependencies":{"hono":"^4"}}`)
+	mustWrite(t, filepath.Join(root, "desktop", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
+	mustWrite(t, filepath.Join(root, "docker-compose.yml"), `services:
+  momentum_web:
+    environment:
+      VITE_MOMENTUM_API_BASE: http://momentum-api.localhost
+`)
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Project.Name != "momentum" {
+		t.Fatalf("unexpected project identity: %#v", plan.Project)
+	}
+	web := serviceNamed(t, plan, "web")
+	assertBinding(t, web, "VITE_MOMENTUM_API_BASE", BindingURL, "server-ts")
+}
+
+func serviceNamed(t *testing.T, plan Plan, name string) Service {
+	t.Helper()
+	for _, service := range plan.Services {
+		if service.Name == name {
+			return service
+		}
+	}
+	t.Fatalf("service %q not found in %#v", name, plan.Services)
+	return Service{}
+}
+
+func assertObservedPort(t *testing.T, service Service, want int) {
+	t.Helper()
+	if len(service.Port.Observed) != 1 || service.Port.Observed[0].Value != want {
+		t.Fatalf("expected %s observed port %d, got %#v", service.Name, want, service.Port.Observed)
+	}
+}
+
+func assertBinding(t *testing.T, service Service, name string, kind BindingKind, target string) {
+	t.Helper()
+	for _, binding := range service.Environment {
+		if binding.Name == name && binding.Kind == kind && binding.Target == target {
+			return
+		}
+	}
+	t.Fatalf("expected %s binding %s -> %s, got %#v", service.Name, name, target, service.Environment)
 }
 
 func mustWrite(t *testing.T, path, contents string) {

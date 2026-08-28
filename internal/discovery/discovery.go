@@ -18,7 +18,6 @@ var (
 	inlinePortPattern     = regexp.MustCompile(`(?:^|\s)(?:PORT|VITE_PORT|NEXT_PORT|NUXT_PORT)\s*=\s*(\d{2,5})(?:\s|$)`)
 	cliPortPattern        = regexp.MustCompile(`(?:--port|-p)\s*(?:=|\s)\s*(\d{2,5})`)
 	structuredPortPattern = regexp.MustCompile(`(?m)\bport\s*:\s*(\d{2,5})\b`)
-	localhostPortPattern  = regexp.MustCompile(`localhost:(\d{2,5})`)
 )
 
 type DetectedService struct {
@@ -469,7 +468,7 @@ func findPort(text string) int {
 		return 0
 	}
 
-	for _, pattern := range []*regexp.Regexp{envPortPattern, inlinePortPattern, cliPortPattern, structuredPortPattern, localhostPortPattern} {
+	for _, pattern := range []*regexp.Regexp{envPortPattern, inlinePortPattern, cliPortPattern, structuredPortPattern} {
 		match := pattern.FindStringSubmatch(text)
 		if len(match) == 2 {
 			return atoi(match[1])

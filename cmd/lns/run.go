@@ -16,9 +16,7 @@ import (
 	"lns/internal/config"
 	"lns/internal/devrun"
 	"lns/internal/devruntime"
-	"lns/internal/discovery"
 	"lns/internal/models"
-	"lns/internal/projectconfig"
 	"lns/internal/projectplan"
 )
 
@@ -80,49 +78,49 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := loadOrBootstrapConfig(root)
+	settings, err := config.LoadSettings()
+	if err != nil {
+		return err
+	}
+	plan, err := buildRunPlan(root, settings)
 	if err != nil {
 		return err
 	}
 	if len(override) > 0 {
 		if len(names) == 0 {
-			selected, err := defaultRunnableService(root, cfg)
+			selected, err := defaultRunnableService(root, plan)
 			if err != nil {
 				return err
 			}
 			names = []string{selected}
 		}
-		service := cfg.Services[names[0]]
+		service, err := serviceByName(plan, names[0])
+		if err != nil {
+			return err
+		}
 		service.Script = ""
 		service.Command = append([]string(nil), override...)
-		service.Status = models.StatusResolved
-		cfg.Services[names[0]] = service
+		service.State = projectplan.StateManaged
+		replaceService(&plan, service)
 	}
 	if len(names) == 0 {
-		names = runnableServiceNames(cfg)
+		names = runnableServiceNames(plan)
 	}
 	if len(names) == 0 {
-		return fmt.Errorf("no runnable services; add a script or command to %s", projectconfig.Filename)
+		return fmt.Errorf("no managed services; run `lns plan` to inspect discovery and recovery steps")
 	}
 	if requestedPort > 0 && len(names) != 1 {
 		return fmt.Errorf("--port can only be used when running one service")
 	}
 
-	if err := syncProjectForRun(root, cfg); err != nil {
-		return err
-	}
-	settings, err := config.LoadSettings()
-	if err != nil {
-		return err
-	}
 	store := devruntime.NewStore()
 	activeLeases, err := store.Load()
 	if err != nil {
 		return err
 	}
-	worktree := devrun.DetectWorktreePrefix(root)
 	runs := make([]serviceRun, 0, len(names))
 	usedPorts := map[int]bool{}
+	ports := make(map[string]int, len(names))
 	for _, lease := range activeLeases {
 		usedPorts[lease.Port] = true
 	}
@@ -143,7 +141,17 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 			}
 		}
 		usedPorts[port] = true
-		run, err := prepareServiceRun(root, cfg, name, port, os.Getpid(), worktree, settings)
+		ports[name] = port
+	}
+	for _, name := range names {
+		service, err := serviceByName(plan, name)
+		if err != nil {
+			return err
+		}
+		if service.State != projectplan.StateManaged {
+			return fmt.Errorf("service %q is %s and cannot be started; run `lns plan` for recovery", name, service.State)
+		}
+		run, err := prepareServiceRun(root, plan, service, ports, os.Getpid())
 		if err != nil {
 			return fmt.Errorf("prepare %s: %w", name, err)
 		}
@@ -171,99 +179,81 @@ func runConfiguredServices(names, override []string, requestedPort int) error {
 	return executeRuns(runs)
 }
 
-func prepareServiceRun(projectRoot string, cfg *projectconfig.Config, serviceName string, port, pid int, worktree string, settings config.Settings) (serviceRun, error) {
-	serviceConfig, ok := cfg.Services[serviceName]
+func prepareServiceRun(projectRoot string, plan projectplan.Plan, service projectplan.Service, ports map[string]int, pid int) (serviceRun, error) {
+	port, ok := ports[service.Name]
 	if !ok {
-		return serviceRun{}, fmt.Errorf("service %q is not defined in %s", serviceName, projectconfig.Filename)
+		return serviceRun{}, fmt.Errorf("service %q has no allocated port", service.Name)
 	}
-	project := cfg.ToProject(projectRoot)
-	var serviceIndex = -1
-	for i := range project.Services {
-		if project.Services[i].Name == serviceName {
-			serviceIndex = i
-			break
-		}
+	model := models.Service{
+		Name: service.Name, Root: service.Root, Script: service.Script,
+		Command: append([]string(nil), service.Command...), Profile: service.Profile,
+		Status: models.StatusResolved,
 	}
-	if serviceIndex < 0 {
-		return serviceRun{}, fmt.Errorf("service %q could not be compiled", serviceName)
-	}
-	service := project.Services[serviceIndex]
-	command, err := devrun.ResolveCommand(projectRoot, service, port)
+	command, err := devrun.ResolveCommand(projectRoot, model, port)
 	if err != nil {
 		return serviceRun{}, err
 	}
-	hostname := devrun.ApplyWorktreePrefix(project.GetServiceHostname(service), worktree)
-	url := formatServiceURLWithTLS(hostname, settings.HTTPPort, settings.HTTPS)
-	root := filepath.Join(projectRoot, serviceConfig.Root)
-	env := append(os.Environ(), devrun.PortEnvironment(projectRoot, service, port)...)
-	env = append(env, "HOST=127.0.0.1", "LNS_URL="+strings.TrimSuffix(url, "/"))
-	for _, related := range project.Services {
-		relatedHostname := devrun.ApplyWorktreePrefix(project.GetServiceHostname(related), worktree)
-		relatedURL := strings.TrimSuffix(formatServiceURLWithTLS(relatedHostname, settings.HTTPPort, settings.HTTPS), "/")
-		key := devrun.EnvironmentName(related.Name)
-		env = append(env, "LNS_"+key+"_URL="+relatedURL, "VITE_LNS_"+key+"_URL="+relatedURL)
+	overrides := map[string]string{"HOST": "127.0.0.1", "LNS_URL": service.URL}
+	for _, value := range devrun.PortEnvironment(projectRoot, model, port) {
+		key, value, _ := strings.Cut(value, "=")
+		overrides[key] = value
 	}
+	for _, related := range plan.Services {
+		key := devrun.EnvironmentName(related.Name)
+		overrides["LNS_"+key+"_URL"] = related.URL
+		overrides["VITE_LNS_"+key+"_URL"] = related.URL
+		if relatedPort, exists := ports[related.Name]; exists {
+			overrides[key+"_PORT"] = fmt.Sprint(relatedPort)
+		}
+	}
+	for _, binding := range service.Environment {
+		switch binding.Kind {
+		case projectplan.BindingPort:
+			if targetPort, exists := ports[binding.Target]; exists {
+				overrides[binding.Name] = fmt.Sprint(targetPort)
+			}
+		case projectplan.BindingURL:
+			target, err := serviceByName(plan, binding.Target)
+			if err != nil {
+				return serviceRun{}, err
+			}
+			overrides[binding.Name] = strings.TrimSuffix(target.URL, "/") + binding.Path
+		default:
+			return serviceRun{}, fmt.Errorf("unsupported environment binding %q", binding.Kind)
+		}
+	}
+	env := devrun.OverlayEnvironment(os.Environ(), overrides)
 	return serviceRun{
-		Name:    serviceName,
-		Root:    root,
+		Name:    service.Name,
+		Root:    filepath.Join(projectRoot, service.Root),
 		Command: command,
-		URL:     url,
+		URL:     service.URL + "/",
 		Lease: devruntime.Lease{
-			Project:  cfg.Name,
-			Service:  serviceName,
-			Root:     root,
-			Hostname: hostname,
+			Project:  plan.Project.Name,
+			Service:  service.Name,
+			Root:     filepath.Join(projectRoot, service.Root),
+			Hostname: service.Hostname,
 			Port:     port,
 			PID:      pid,
-			Worktree: worktree,
-			Profile:  service.Profile,
+			Worktree: plan.Project.Worktree,
+			Profile:  model.Profile,
 		},
 		Env: env,
 	}, nil
 }
 
-func loadOrBootstrapConfig(root string) (*projectconfig.Config, error) {
-	if projectconfig.Exists(root) {
-		cfg, err := projectconfig.Load(root)
-		if err != nil {
-			return nil, err
-		}
-		changed := false
-		for name, service := range cfg.Services {
-			if service.Script != "" || len(service.Command) > 0 {
-				continue
-			}
-			if detected, ok := discovery.InspectServiceRoot(root, service.Root); ok && detected.Script != "" {
-				service.Script = detected.Script
-				if service.Profile == "" {
-					service.Profile = detected.Profile
-				}
-				service.Status = models.StatusResolved
-				cfg.Services[name] = service
-				changed = true
-			}
-		}
-		if changed {
-			if err := projectconfig.Save(root, cfg); err != nil {
-				return nil, err
-			}
-			printSuccess("Updated runnable scripts in %s", projectconfig.Path(root))
-		}
-		return cfg, nil
+func buildRunPlan(root string, settings config.Settings) (projectplan.Plan, error) {
+	scheme := "http"
+	if settings.HTTPS {
+		scheme = "https"
 	}
-	cfg := discovery.BootstrapConfig(projectplan.ProjectName(root), root, "")
-	if err := projectconfig.Save(root, cfg); err != nil {
-		return nil, err
-	}
-	printSuccess("Created %s", projectconfig.Path(root))
-	return cfg, nil
+	return projectplan.Build(root, projectplan.Route{Scheme: scheme, Port: settings.HTTPPort})
 }
 
-func runnableServiceNames(cfg *projectconfig.Config) []string {
-	project := cfg.ToProject("")
+func runnableServiceNames(plan projectplan.Plan) []string {
 	var names []string
-	for _, service := range project.Services {
-		if service.CanRun() {
+	for _, service := range plan.Services {
+		if service.State == projectplan.StateManaged {
 			names = append(names, service.Name)
 		}
 	}
@@ -271,18 +261,37 @@ func runnableServiceNames(cfg *projectconfig.Config) []string {
 	return names
 }
 
-func defaultRunnableService(root string, cfg *projectconfig.Config) (string, error) {
-	names := runnableServiceNames(cfg)
+func defaultRunnableService(root string, plan projectplan.Plan) (string, error) {
+	names := runnableServiceNames(plan)
 	if len(names) == 1 {
 		return names[0], nil
 	}
 	for _, name := range names {
-		serviceRoot := filepath.Clean(filepath.Join(root, cfg.Services[name].Root))
+		service, _ := serviceByName(plan, name)
+		serviceRoot := filepath.Clean(filepath.Join(root, service.Root))
 		if sameFilePath(serviceRoot, root) {
 			return name, nil
 		}
 	}
 	return "", fmt.Errorf("choose a service: %s", strings.Join(names, ", "))
+}
+
+func serviceByName(plan projectplan.Plan, name string) (projectplan.Service, error) {
+	for _, service := range plan.Services {
+		if service.Name == name {
+			return service, nil
+		}
+	}
+	return projectplan.Service{}, fmt.Errorf("service %q is not in the project plan", name)
+}
+
+func replaceService(plan *projectplan.Plan, replacement projectplan.Service) {
+	for index := range plan.Services {
+		if plan.Services[index].Name == replacement.Name {
+			plan.Services[index] = replacement
+			return
+		}
+	}
 }
 
 func ensureProxyReady(settings config.Settings) error {

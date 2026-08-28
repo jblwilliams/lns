@@ -63,16 +63,32 @@ type Project struct {
 }
 
 type Service struct {
-	Name     string         `json:"name"`
-	Root     string         `json:"root"`
-	Script   string         `json:"script,omitempty"`
-	Command  []string       `json:"command,omitempty"`
-	Profile  models.Profile `json:"profile"`
-	State    ServiceState   `json:"state"`
-	Hostname string         `json:"hostname"`
-	URL      string         `json:"url"`
-	Port     Port           `json:"port"`
-	Evidence []string       `json:"evidence"`
+	Name        string               `json:"name"`
+	Root        string               `json:"root"`
+	Script      string               `json:"script,omitempty"`
+	Command     []string             `json:"command,omitempty"`
+	Profile     models.Profile       `json:"profile"`
+	State       ServiceState         `json:"state"`
+	Hostname    string               `json:"hostname"`
+	URL         string               `json:"url"`
+	Port        Port                 `json:"port"`
+	Environment []EnvironmentBinding `json:"environment,omitempty"`
+	Evidence    []string             `json:"evidence"`
+}
+
+type BindingKind string
+
+const (
+	BindingPort BindingKind = "port"
+	BindingURL  BindingKind = "url"
+)
+
+type EnvironmentBinding struct {
+	Name     string      `json:"name"`
+	Kind     BindingKind `json:"kind"`
+	Target   string      `json:"target"`
+	Path     string      `json:"path,omitempty"`
+	Evidence string      `json:"evidence"`
 }
 
 type Port struct {
@@ -213,6 +229,7 @@ func Build(root string, route Route) (Plan, error) {
 	}
 
 	sort.Slice(plan.Services, func(i, j int) bool { return plan.Services[i].Name < plan.Services[j].Name })
+	inferEnvironment(absRoot, &plan)
 	if len(plan.Services) == 0 {
 		plan.Warnings = append(plan.Warnings, Warning{
 			Code:     "no-services",
@@ -234,6 +251,9 @@ func Build(root string, route Route) (Plan, error) {
 func ProjectName(root string) string {
 	if absolute, err := filepath.Abs(root); err == nil {
 		root = absolute
+	}
+	if name := composeProjectName(root); name != "" {
+		return name
 	}
 	data, err := os.ReadFile(filepath.Join(root, "package.json"))
 	if err == nil {

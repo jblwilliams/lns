@@ -209,6 +209,20 @@ func TestDetectDriftReportsPortAndProfileMismatch(t *testing.T) {
 	}
 }
 
+func TestDetectServicesDoesNotTreatDatabaseURLAsHTTPListener(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "package.json"), `{"scripts":{"dev":"tsx watch server.ts"},"dependencies":{"hono":"^4"}}`)
+	mustWriteFile(t, filepath.Join(root, ".env"), "DATABASE_URL=postgres://user:pass@localhost:5432/app\nREDIS_URL=redis://localhost:6379\n")
+
+	services := DetectServices(root)
+	if len(services) != 1 {
+		t.Fatalf("expected one service, got %#v", services)
+	}
+	if services[0].Port != 0 || services[0].PortEvidence != "" {
+		t.Fatalf("database dependency was mistaken for HTTP listener: %#v", services[0])
+	}
+}
+
 func mustWriteFile(t *testing.T, path, contents string) {
 	t.Helper()
 	mustMkdir(t, filepath.Dir(path))

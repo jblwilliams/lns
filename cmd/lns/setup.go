@@ -120,7 +120,7 @@ func promptPort(reader *bufio.Reader, label string, defaultPort int) (int, error
 
 func printProxyPortHelp(defaultPort int, https bool) {
 	color.New(color.Faint).Println("This is the port where the shared Caddy proxy listens for all *.localhost routes.")
-	color.New(color.Faint).Printf("Default: %s\n", formatServiceURLWithTLS("project-a.localhost", config.DefaultHTTPPort, true))
+	color.New(color.Faint).Printf("Default: %s\n", formatServiceURLWithTLS("project-a.localhost", config.DefaultHTTPPort, false))
 	color.New(color.Faint).Printf("Unprivileged fallback: %s\n", formatServiceURLWithTLS("project-a.localhost", config.FallbackHTTPPort, https))
 	if defaultPort != config.DefaultHTTPPort && defaultPort != config.FallbackHTTPPort {
 		color.New(color.Faint).Printf("Current setting: %s\n", formatServiceURLWithTLS("project-a.localhost", defaultPort, https))
