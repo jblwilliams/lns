@@ -236,6 +236,13 @@ func TestExplicitRemoteEnvironmentBlocksLocalExampleInference(t *testing.T) {
 	}
 	assertNoBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL")
 
+	mustWrite(t, filepath.Join(root, ".env.local"), "VITE_API_URL=http://staging-api:8080\n")
+	plan, err = Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL")
+
 	t.Setenv("VITE_API_URL", "https://shell.example.com")
 	mustWrite(t, filepath.Join(root, ".env"), "VITE_API_URL=http://localhost:3001\n")
 	plan, err = Build(root, Route{Scheme: "http", Port: 80})
@@ -243,6 +250,29 @@ func TestExplicitRemoteEnvironmentBlocksLocalExampleInference(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL")
+}
+
+func TestExactComposeServiceHostIsEligibleForLocalInference(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "package.json"), `{
+  "name":"demo", "private":true, "workspaces":["web","server-ts"]
+}`)
+	mustWrite(t, filepath.Join(root, "web", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7"}}`)
+	mustWrite(t, filepath.Join(root, "server-ts", "package.json"), `{"scripts":{"dev":"tsx watch src/index.ts"},"dependencies":{"hono":"^4"}}`)
+	mustWrite(t, filepath.Join(root, "docker-compose.yml"), `services:
+  demo_server_ts:
+    environment:
+      PORT: 8787
+  demo_web:
+    environment:
+      VITE_API_URL: http://demo_server_ts:8787
+`)
+
+	plan, err := Build(root, Route{Scheme: "http", Port: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBinding(t, serviceNamed(t, plan, "web"), "VITE_API_URL", BindingURL, "server-ts")
 }
 
 func TestBuildInfersMomentumAPIFromGenericRole(t *testing.T) {

@@ -44,6 +44,20 @@ func TestResolveCommandOverridesFixedNextPort(t *testing.T) {
 	}
 }
 
+func TestPackageManagerLockfilePrecedenceIsDeterministic(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"pnpm-lock.yaml", "yarn.lock", "package-lock.json"} {
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		if got := packageManager(root, root, ""); got != "pnpm" {
+			t.Fatalf("expected pnpm precedence, got %q", got)
+		}
+	}
+}
+
 func TestApplyWorktreePrefixCreatesBranchSubdomain(t *testing.T) {
 	if got := ApplyWorktreePrefix("demo-web.localhost", "fix-auth"); got != "fix-auth.demo-web.localhost" {
 		t.Fatalf("unexpected worktree hostname %q", got)

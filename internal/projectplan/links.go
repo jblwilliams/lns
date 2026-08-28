@@ -30,9 +30,10 @@ type environmentSignal struct {
 
 func inferEnvironment(root string, route Route, plan *Plan) {
 	signals := readEnvironmentSignals(root, plan.Services)
+	localHosts := knownLocalHTTPHosts(root, plan.Services)
 	applyNamedPorts(plan, signals)
 	for _, signal := range signals {
-		endpoint, ok := localHTTPEndpoint(signal.value)
+		endpoint, ok := localHTTPEndpoint(signal.value, localHosts)
 		if !ok || !isServiceLinkName(signal.name) {
 			continue
 		}
@@ -452,16 +453,53 @@ func isNamedPort(name, value string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func localHTTPEndpoint(value string) (*url.URL, bool) {
+func localHTTPEndpoint(value string, knownHosts map[string]bool) (*url.URL, bool) {
 	endpoint, err := url.Parse(value)
 	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https" && endpoint.Scheme != "ws" && endpoint.Scheme != "wss") {
 		return nil, false
 	}
 	host := strings.ToLower(endpoint.Hostname())
-	if host == "localhost" || host == "127.0.0.1" || strings.HasSuffix(host, ".localhost") || (!strings.Contains(host, ".") && host != "") {
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasSuffix(host, ".localhost") || knownHosts[discovery.NormalizeName(host)] {
 		return endpoint, true
 	}
 	return nil, false
+}
+
+func knownLocalHTTPHosts(root string, services []Service) map[string]bool {
+	hosts := map[string]bool{}
+	for _, service := range services {
+		if name := discovery.NormalizeName(service.Name); name != "" {
+			hosts[name] = true
+		}
+	}
+	for _, name := range []string{"compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"} {
+		file, err := os.Open(filepath.Join(root, name))
+		if err != nil {
+			continue
+		}
+		inServices := false
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			if indent == 0 {
+				inServices = strings.HasPrefix(trimmed, "services:")
+				continue
+			}
+			if inServices && indent == 2 && strings.HasSuffix(trimmed, ":") {
+				service := strings.Trim(strings.TrimSuffix(trimmed, ":"), `"'`)
+				if service = discovery.NormalizeName(service); service != "" {
+					hosts[service] = true
+				}
+			}
+		}
+		_ = file.Close()
+	}
+	return hosts
 }
 
 func ignoredLinkName(name string) bool {

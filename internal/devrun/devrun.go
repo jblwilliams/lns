@@ -135,16 +135,17 @@ func packageManager(projectRoot, serviceRoot, declared string) string {
 	if name := strings.Split(strings.TrimSpace(declared), "@")[0]; name == "npm" || name == "pnpm" || name == "yarn" || name == "bun" {
 		return name
 	}
+	lockfiles := []struct{ file, manager string }{
+		{"pnpm-lock.yaml", "pnpm"},
+		{"yarn.lock", "yarn"},
+		{"bun.lock", "bun"},
+		{"bun.lockb", "bun"},
+		{"package-lock.json", "npm"},
+	}
 	for dir := serviceRoot; ; dir = filepath.Dir(dir) {
-		for file, manager := range map[string]string{
-			"pnpm-lock.yaml":    "pnpm",
-			"yarn.lock":         "yarn",
-			"bun.lock":          "bun",
-			"bun.lockb":         "bun",
-			"package-lock.json": "npm",
-		} {
-			if _, err := os.Stat(filepath.Join(dir, file)); err == nil {
-				return manager
+		for _, lockfile := range lockfiles {
+			if _, err := os.Stat(filepath.Join(dir, lockfile.file)); err == nil {
+				return lockfile.manager
 			}
 		}
 		if samePath(dir, projectRoot) || filepath.Dir(dir) == dir {

@@ -91,7 +91,7 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, fmt.Errorf("create dependency state: %w", err)
 	}
-	project := runtimeProject(request.Project, root, request.Worktree)
+	stateID := runtimeStateID(request.Project, root, request.Worktree)
 	session := &Session{overrides: map[string]map[string]string{}, runner: runner}
 	failed := true
 	defer func() {
@@ -177,7 +177,7 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 		return session, nil
 	}
 	if len(managedProviders) > 0 {
-		overridePath := filepath.Join(stateDir, project+".override.yml")
+		overridePath := filepath.Join(stateDir, stateID+".override.yml")
 		if err := os.WriteFile(overridePath, []byte(overrideYAML(managedProviders)), 0600); err != nil {
 			return nil, fmt.Errorf("write dependency override: %w", err)
 		}
@@ -285,7 +285,7 @@ func composeMayHaveProviders(path string) bool {
 	return false
 }
 
-func runtimeProject(project, root, worktree string) string {
+func runtimeStateID(project, root, worktree string) string {
 	hash := sha256.Sum256([]byte(root + "\x00" + worktree))
 	name := "lns-" + discovery.NormalizeName(project) + "-" + hex.EncodeToString(hash[:4])
 	return strings.Trim(name, "-")
@@ -298,6 +298,16 @@ type ownerRecord struct {
 }
 
 func claimOwner(path string) (ownerRecord, error) {
+	var claimed ownerRecord
+	err := withOwnerClaimLock(path, func() error {
+		var err error
+		claimed, err = claimOwnerLocked(path)
+		return err
+	})
+	return claimed, err
+}
+
+func claimOwnerLocked(path string) (ownerRecord, error) {
 	data, _ := json.Marshal(ownerRecord{PID: os.Getpid()})
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err == nil {
@@ -355,8 +365,13 @@ type composeModel struct {
 }
 
 func composeOwner(name, root string) string {
-	if name = discovery.NormalizeName(name); name != "" {
-		return "compose-" + name
+	if name = strings.TrimSpace(name); name != "" {
+		hash := sha256.Sum256([]byte(name))
+		label := discovery.NormalizeName(name)
+		if label == "" {
+			label = "project"
+		}
+		return "compose-" + label + "-" + hex.EncodeToString(hash[:8])
 	}
 	hash := sha256.Sum256([]byte(root))
 	return "compose-" + hex.EncodeToString(hash[:8])

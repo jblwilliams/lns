@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"lns/internal/projectplan"
 )
@@ -45,6 +47,9 @@ func TestComposeOwnerFollowsComposeProjectAcrossWorktrees(t *testing.T) {
 	if composeOwner("peyra", "/worktrees/main") != composeOwner("peyra", "/worktrees/feature") {
 		t.Fatal("worktrees sharing a named Compose project must share one ownership lock")
 	}
+	if composeOwner("foo_bar", "/projects/one") == composeOwner("foo-bar", "/projects/two") {
+		t.Fatal("distinct raw Compose project names must not share one ownership lock")
+	}
 	if composeOwner("", "/projects/one") == composeOwner("", "/projects/two") {
 		t.Fatal("unnamed Compose projects in different roots must not share a lock")
 	}
@@ -70,6 +75,45 @@ func TestClaimOwnerReturnsStaleStartedServices(t *testing.T) {
 	}
 	if !reflect.DeepEqual(stale.Started, []string{"postgres", "worker"}) || stale.Override != "/tmp/old.yml" {
 		t.Fatalf("stale ownership was lost: %#v", stale)
+	}
+}
+
+func TestOwnerClaimLockSerializesStaleReplacement(t *testing.T) {
+	state := t.TempDir()
+	owner := filepath.Join(state, "compose-demo.owner.json")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- withOwnerClaimLock(owner, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	var secondEntered atomic.Bool
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- withOwnerClaimLock(owner, func() error {
+			secondEntered.Store(true)
+			return nil
+		})
+	}()
+	time.Sleep(75 * time.Millisecond)
+	if secondEntered.Load() {
+		t.Fatal("a concurrent stale-owner replacement bypassed the active claim")
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if !secondEntered.Load() {
+		t.Fatal("waiting owner claim did not continue after unlock")
 	}
 }
 

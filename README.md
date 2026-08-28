@@ -85,6 +85,8 @@ For recognized Postgres and Redis dependencies, LNS:
 
 External database hosts, TLS Redis URLs, test database URLs, host networking, published worker ports, global Compose resources, and unsafe dependency graphs are not silently rewritten or started.
 
+LNS coordinates ownership with other LNS runs. Do not run a mutating `docker compose up`, `stop`, or `down` for the same local project while LNS owns it; stop LNS first.
+
 LNS deliberately does not invent a project-specific database bootstrap. Existing development volumes continue to work. A fresh database still needs the repository's normal migrations, role provisioning, tenant choices, or seed commands.
 
 ## Opt-in by design
@@ -114,6 +116,8 @@ fix-auth worktree:   http://fix-auth.my-app.localhost
 ```
 
 If multiple worktrees intentionally share one explicitly named Compose project, LNS allows only one of them to own that dependency stack at a time. The second run fails with the owning PID instead of recreating or stopping the first worktree's database.
+
+Worktree prefixes isolate LNS routes and application ports. A project's own hard-coded CORS allowlists and worktree-specific database bootstrap still apply; LNS does not rewrite application policy or copy data between Compose projects.
 
 ## Useful commands
 
