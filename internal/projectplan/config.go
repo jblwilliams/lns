@@ -110,6 +110,14 @@ func loadConfigProject(root string) (models.Project, error) {
 			Profile: service.Profile, Hostname: hostname, Status: models.StatusResolved,
 		})
 	}
+	hostnames := map[string]string{}
+	for _, service := range project.Services {
+		hostname := project.GetServiceHostname(service)
+		if other := hostnames[hostname]; other != "" {
+			return models.Project{}, fmt.Errorf("services %q and %q resolve to the same hostname %q", other, service.Name, hostname)
+		}
+		hostnames[hostname] = service.Name
+	}
 	return project, nil
 }
 

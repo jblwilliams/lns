@@ -78,6 +78,72 @@ func TestClaimOwnerReturnsStaleStartedServices(t *testing.T) {
 	}
 }
 
+func TestStartClearsStaleOwnershipBeforeRemovingOverride(t *testing.T) {
+	request, config, ownerPath, overridePath := staleStartFixture(t)
+	runner := &fakeRunner{config: config, running: "postgres\n", ports: map[string]string{"postgres": "127.0.0.1:49101\n"}}
+
+	session, err := start(context.Background(), request, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runner.calledTail("stop", "postgres") {
+		t.Fatalf("stale service was not stopped: %#v", runner.calls)
+	}
+	var owner ownerRecord
+	data, err := os.ReadFile(ownerPath)
+	if err != nil || json.Unmarshal(data, &owner) != nil {
+		t.Fatalf("read current ownership: %v, %s", err, data)
+	}
+	if owner.PID != os.Getpid() || len(owner.Started) != 0 || owner.Override != "" {
+		t.Fatalf("stale ownership was not durably cleared: %#v", owner)
+	}
+	if _, err := os.Stat(overridePath); !os.IsNotExist(err) {
+		t.Fatalf("stale override was not removed after ownership clear: %v", err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartPreservesStaleOwnershipWhenStopFails(t *testing.T) {
+	request, config, ownerPath, overridePath := staleStartFixture(t)
+	runner := &fakeRunner{config: config, failOn: "stop"}
+
+	_, err := start(context.Background(), request, runner)
+	if err == nil || !strings.Contains(err.Error(), "stop stale") {
+		t.Fatalf("expected stale-stop failure, got %v", err)
+	}
+	var owner ownerRecord
+	data, readErr := os.ReadFile(ownerPath)
+	if readErr != nil || json.Unmarshal(data, &owner) != nil {
+		t.Fatalf("read preserved ownership: %v, %s", readErr, data)
+	}
+	if !reflect.DeepEqual(owner.Started, []string{"postgres"}) || owner.Override != overridePath {
+		t.Fatalf("stale ownership was lost after failed stop: %#v", owner)
+	}
+	if _, err := os.Stat(overridePath); err != nil {
+		t.Fatalf("stale override was removed after failed stop: %v", err)
+	}
+}
+
+func staleStartFixture(t *testing.T) (Request, []byte, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	stateDir := t.TempDir()
+	mustWriteDependencyFile(t, filepath.Join(root, "compose.yml"), "services:\n  postgres:\n    image: postgres:18\n")
+	model := composeModel{Name: "demo", Services: map[string]composeService{
+		"server": {DependsOn: dependencies("postgres")}, "postgres": {Image: "postgres:18"},
+	}}
+	config, _ := json.Marshal(model)
+	ownerPath := filepath.Join(stateDir, composeOwner(model.Name, root)+".owner.json")
+	overridePath := filepath.Join(stateDir, "stale.override.yml")
+	mustWriteDependencyFile(t, overridePath, "services: {}\n")
+	mustWriteDependencyFile(t, ownerPath, fmt.Sprintf(`{"pid":99999999,"started":["postgres"],"override":%q}`, overridePath))
+	return Request{
+		Root: root, Project: "demo", Services: []projectplan.Service{{Name: "server", Root: "."}}, StateDir: stateDir,
+	}, config, ownerPath, overridePath
+}
+
 func TestOwnerClaimLockSerializesStaleReplacement(t *testing.T) {
 	state := t.TempDir()
 	owner := filepath.Join(state, "compose-demo.owner.json")
@@ -205,6 +271,18 @@ func TestSelectDependenciesIncludesMatchingWorkerClosure(t *testing.T) {
 	}
 	if want := []string{"momentum_fetcher", "momentum_worker_ts"}; !reflect.DeepEqual(backgrounds, want) {
 		t.Fatalf("backgrounds: want %#v, got %#v", want, backgrounds)
+	}
+}
+
+func TestSelectDependenciesRejectsWorkerClosureThroughForegroundApp(t *testing.T) {
+	model := composeModel{Services: map[string]composeService{
+		"demo_server": {DependsOn: dependencies("postgres")},
+		"demo_worker": {DependsOn: dependencies("demo_server", "postgres")},
+		"postgres":    {Image: "postgres:18"},
+	}}
+	_, _, err := selectDependencies(model, []projectplan.Service{{Name: "server"}})
+	if err == nil || !strings.Contains(err.Error(), "demo_worker") || !strings.Contains(err.Error(), "demo_server") {
+		t.Fatalf("expected worker/foreground intersection error, got %v", err)
 	}
 }
 
@@ -409,6 +487,29 @@ func TestClosePreservesOwnershipWhenComposeStopFails(t *testing.T) {
 	}
 	if _, err := os.Stat(override); err != nil {
 		t.Fatalf("override was removed after failed stop: %v", err)
+	}
+	if !reflect.DeepEqual(session.started, []string{"postgres"}) {
+		t.Fatalf("started services were forgotten: %#v", session.started)
+	}
+}
+
+func TestClosePreservesOwnershipWhenOwnerClearFails(t *testing.T) {
+	state := t.TempDir()
+	owner := filepath.Join(state, "compose-demo.owner.json")
+	override := filepath.Join(state, "demo.override.yml")
+	if err := os.Mkdir(owner, 0700); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteDependencyFile(t, override, "services: {}\n")
+	session := &Session{
+		runner: &fakeRunner{}, ownerPath: owner, started: []string{"postgres"},
+		command: composeCommand{root: t.TempDir(), source: "compose.yml", override: override},
+	}
+	if err := session.Close(context.Background()); err == nil || !strings.Contains(err.Error(), "clear Docker dependency ownership") {
+		t.Fatalf("expected owner-clear failure, got %v", err)
+	}
+	if _, err := os.Stat(override); err != nil {
+		t.Fatalf("override was removed before ownership was durably cleared: %v", err)
 	}
 	if !reflect.DeepEqual(session.started, []string{"postgres"}) {
 		t.Fatalf("started services were forgotten: %#v", session.started)

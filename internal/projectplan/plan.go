@@ -93,6 +93,7 @@ type EnvironmentBinding struct {
 	Name     string         `json:"name"`
 	Kind     BindingKind    `json:"kind"`
 	Target   EndpointRef    `json:"target"`
+	Required bool           `json:"required,omitempty"`
 	Scheme   string         `json:"scheme,omitempty"`
 	Path     string         `json:"path,omitempty"`
 	Evidence string         `json:"evidence"`

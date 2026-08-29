@@ -381,6 +381,9 @@ func expandServiceClosure(plan projectplan.Plan, selected []projectplan.Service)
 		service := queue[0]
 		queue = queue[1:]
 		for _, binding := range service.Environment {
+			if !binding.Required {
+				continue
+			}
 			targetName := binding.Target.Service
 			if targetName == "" || included[targetName] {
 				continue

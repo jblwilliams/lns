@@ -53,6 +53,7 @@ func inferEnvironment(root string, route Route, plan *Plan) {
 			Scheme: endpoint.Scheme, Path: endpointPath(endpoint), Evidence: signal.evidence, Network: network,
 		}
 		for _, index := range bindingConsumers(plan.Services, signal) {
+			binding.Required = bindingRequiresTarget(signal, plan.Services[index], target)
 			addBinding(&plan.Services[index], binding)
 		}
 	}
@@ -245,18 +246,37 @@ func applyNamedPorts(plan *Plan, signals []environmentSignal) {
 			continue
 		}
 		for index := range plan.Services {
-			if plan.Services[index].Name == target.Service {
-				for listenerIndex := range plan.Services[index].Listeners {
-					if plan.Services[index].Listeners[listenerIndex].Name == target.Listener {
-						plan.Services[index].Listeners[listenerIndex].Port.Observed = []ObservedPort{{Value: port, Evidence: signal.evidence + ":" + signal.name}}
-					}
+			if plan.Services[index].Name != target.Service {
+				continue
+			}
+			for listenerIndex := range plan.Services[index].Listeners {
+				if plan.Services[index].Listeners[listenerIndex].Name == target.Listener {
+					plan.Services[index].Listeners[listenerIndex].Port.Observed = []ObservedPort{{Value: port, Evidence: signal.evidence + ":" + signal.name}}
 				}
 			}
+		}
+		for _, index := range bindingConsumers(plan.Services, signal) {
 			addBinding(&plan.Services[index], EnvironmentBinding{
-				Name: signal.name, Kind: BindingPort, Target: target, Evidence: signal.evidence, Network: NetworkLoopback,
+				Name: signal.name, Kind: BindingPort, Target: target,
+				Required: bindingRequiresTarget(signal, plan.Services[index], target),
+				Evidence: signal.evidence, Network: NetworkLoopback,
 			})
 		}
 	}
+}
+
+func bindingRequiresTarget(signal environmentSignal, consumer Service, target EndpointRef) bool {
+	if consumer.Name == target.Service {
+		return false
+	}
+	upper := strings.ToUpper(signal.name)
+	if originBindingName(upper) {
+		return false
+	}
+	if signal.consumer != "" {
+		return true
+	}
+	return frontendBindingName(upper)
 }
 
 func resolvePortTarget(services []Service, prefix string, port int) EndpointRef {
@@ -336,11 +356,11 @@ func bindingConsumers(services []Service, signal environmentSignal) []int {
 			continue
 		}
 		switch {
-		case strings.HasPrefix(upper, "VITE_"), strings.Contains(upper, "API_PROXY"), strings.Contains(upper, "API_TARGET"):
+		case frontendBindingName(upper):
 			if serviceProfile(service) == models.ProfileHMR {
 				indexes = append(indexes, index)
 			}
-		case strings.Contains(upper, "CORS"), strings.Contains(upper, "FRONTEND_ORIGIN"), strings.Contains(upper, "CLIENT_ORIGIN"):
+		case originBindingName(upper):
 			if serviceProfile(service) == models.ProfileStandard {
 				indexes = append(indexes, index)
 			}
@@ -349,6 +369,14 @@ func bindingConsumers(services []Service, signal environmentSignal) []int {
 		}
 	}
 	return indexes
+}
+
+func frontendBindingName(upper string) bool {
+	return strings.HasPrefix(upper, "VITE_") || strings.Contains(upper, "API_PROXY") || strings.Contains(upper, "API_TARGET")
+}
+
+func originBindingName(upper string) bool {
+	return strings.Contains(upper, "CORS") || strings.Contains(upper, "FRONTEND_ORIGIN") || strings.Contains(upper, "CLIENT_ORIGIN")
 }
 
 func addBinding(service *Service, binding EnvironmentBinding) {

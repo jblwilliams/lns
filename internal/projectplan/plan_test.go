@@ -211,12 +211,42 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/peyra
 	assertBinding(t, web, "SERVER_PORT", BindingPort, "server")
 	assertBinding(t, web, "VITE_API_URL", BindingURL, "server")
 	assertBinding(t, server, "CORS_ORIGIN", BindingURL, "web")
+	assertBindingRequired(t, web, "VITE_API_URL", true)
+	assertBindingRequired(t, server, "CORS_ORIGIN", false)
 	for _, service := range plan.Services {
 		for _, binding := range service.Environment {
 			if binding.Name == "DATABASE_URL" {
 				t.Fatal("database values must not be exposed as HTTP service links")
 			}
 		}
+	}
+}
+
+func TestNamedPortSignalsStayWithTheirConsumer(t *testing.T) {
+	plan := Plan{Services: []Service{
+		{Name: "api", State: StateManaged, Listeners: []Listener{{Name: "http"}}},
+		{Name: "admin", State: StateManaged, Listeners: []Listener{{Name: "http"}}},
+		{Name: "web", State: StateManaged, Listeners: []Listener{{Name: "http"}}},
+	}}
+	applyNamedPorts(&plan, []environmentSignal{{name: "API_PORT", value: "3001", evidence: "apps/admin/.env", consumer: "admin"}})
+
+	assertBinding(t, serviceNamed(t, plan, "admin"), "API_PORT", BindingPort, "api")
+	assertBindingRequired(t, serviceNamed(t, plan, "admin"), "API_PORT", true)
+	assertNoBinding(t, serviceNamed(t, plan, "web"), "API_PORT")
+	assertNoBinding(t, serviceNamed(t, plan, "api"), "API_PORT")
+}
+
+func TestBuildRejectsDuplicateConfiguredHostnames(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "lns.json"), `{
+  "name":"demo",
+  "services":{
+    "api":{"command":["api"],"hostname":"demo-web.localhost"},
+    "web":{"command":["web"]}
+  }
+}`)
+	if _, err := Build(root, Route{Scheme: "http", Port: 80}); err == nil || !strings.Contains(err.Error(), "demo-web.localhost") {
+		t.Fatalf("expected duplicate hostname error, got %v", err)
 	}
 }
 
@@ -402,6 +432,19 @@ func assertBinding(t *testing.T, service Service, name string, kind BindingKind,
 		}
 	}
 	t.Fatalf("expected %s binding %s -> %s, got %#v", service.Name, name, target, service.Environment)
+}
+
+func assertBindingRequired(t *testing.T, service Service, name string, required bool) {
+	t.Helper()
+	for _, binding := range service.Environment {
+		if binding.Name == name {
+			if binding.Required != required {
+				t.Fatalf("%s binding %s required: want %t, got %#v", service.Name, name, required, binding)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing %s binding %s", service.Name, name)
 }
 
 func assertNoBinding(t *testing.T, service Service, name string) {

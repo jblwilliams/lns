@@ -77,8 +77,8 @@ func (s *Store) Add(lease Lease) error {
 			if existing.Port == lease.Port && !sameLease {
 				return fmt.Errorf("port %d is already leased by %s:%s", lease.Port, existing.Project, existing.Service)
 			}
-			if existing.Hostname == lease.Hostname && existing.PID != lease.PID {
-				return fmt.Errorf("hostname %q is already owned by process %d", lease.Hostname, existing.PID)
+			if existing.Hostname == lease.Hostname && !sameLease {
+				return fmt.Errorf("hostname %q is already leased by %s:%s", lease.Hostname, existing.Project, existing.Service)
 			}
 		}
 		filtered := leases[:0]

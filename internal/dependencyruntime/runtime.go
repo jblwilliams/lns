@@ -1,7 +1,8 @@
 // Package dependencyruntime owns ephemeral host access to local Compose
-// dependencies. It never edits the inspected repository or starts selected
-// foreground application services from Compose. Private workers that belong to
-// a selected service remain under Compose so their internal service links work.
+// dependencies. LNS itself never edits the inspected repository or starts
+// selected foreground application services from Compose. Private workers that
+// belong to a selected service remain under Compose so their internal service
+// links work.
 package dependencyruntime
 
 import (
@@ -136,12 +137,12 @@ func start(ctx context.Context, request Request, runner commandRunner) (*Session
 			failed = false // preserve the record so the next run can retry cleanup
 			return nil, fmt.Errorf("stop stale LNS Docker dependencies: %w", err)
 		}
-		if filepath.Dir(filepath.Clean(stale.Override)) == filepath.Clean(stateDir) {
-			_ = os.Remove(stale.Override)
-		}
-		session.started = nil
 		if err := writeOwner(ownerPath, nil, ""); err != nil {
 			return nil, fmt.Errorf("clear stale Docker dependency ownership: %w", err)
+		}
+		session.started = nil
+		if filepath.Dir(filepath.Clean(stale.Override)) == filepath.Clean(stateDir) {
+			_ = os.Remove(stale.Override)
 		}
 	}
 	runningOutput, err := runner.Run(ctx, root, environment, "docker", composeArgs(inspect, "ps", "--status", "running", "--services")...)
@@ -237,6 +238,11 @@ func (session *Session) Close(ctx context.Context) error {
 		_, closeErr = session.runner.Run(ctx, session.command.root, session.command.environment, "docker", composeArgs(session.command, append([]string{"stop"}, session.started...)...)...)
 		if closeErr != nil {
 			return fmt.Errorf("stop Docker dependencies: %w", closeErr)
+		}
+		if session.ownerPath != "" {
+			if err := writeOwner(session.ownerPath, nil, ""); err != nil {
+				return fmt.Errorf("clear Docker dependency ownership: %w", err)
+			}
 		}
 		session.started = nil
 	}
@@ -427,9 +433,23 @@ func selectDependencies(model composeModel, services []projectplan.Service) ([]p
 		}
 	}
 	backgroundClosure := map[string]bool{}
+	serviceNames := make([]string, 0, len(model.Services))
 	for name := range model.Services {
+		serviceNames = append(serviceNames, name)
+	}
+	sort.Strings(serviceNames)
+	for _, name := range serviceNames {
 		if matchesBackground(name, matchedApps) {
-			collectServiceAndDependencies(model, name, backgroundClosure)
+			closure := map[string]bool{}
+			collectServiceAndDependencies(model, name, closure)
+			for _, app := range sortedKeys(matchedApps) {
+				if closure[app] {
+					return nil, nil, fmt.Errorf("Compose background %q depends on selected foreground service %q; run that worker outside Compose or remove the dependency", name, app)
+				}
+			}
+			for dependency := range closure {
+				backgroundClosure[dependency] = true
+			}
 		}
 	}
 	var providers []provider

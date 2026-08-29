@@ -79,3 +79,14 @@ func TestStoreRejectsPortOwnedByAnotherActiveService(t *testing.T) {
 		t.Fatal("expected active runtime port conflict")
 	}
 }
+
+func TestStoreRejectsHostnameOwnedByDifferentLeaseWithSamePID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := NewStore()
+	if err := store.Add(Lease{Project: "demo", Service: "web", Hostname: "demo.localhost", Port: 4101, PID: os.Getpid()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(Lease{Project: "other", Service: "api", Hostname: "demo.localhost", Port: 4102, PID: os.Getpid()}); err == nil {
+		t.Fatal("expected active runtime hostname conflict")
+	}
+}
